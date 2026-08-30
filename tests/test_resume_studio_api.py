@@ -294,25 +294,37 @@ class ResumeStudioApiTests(unittest.TestCase):
 					"task": "开发工具",
 					"action": fact["content"],
 					"result": "2024 年服务 20 名用户",
-					"bullet": fact["content"],
+					"bullet": fact["content"] + "；我参与 Python 模块实现，未负责整体技术方案。",
 					"technologies": ["Python"],
 					"fact_ids": [fact["id"]],
-					"clarification_ids": [],
+					"clarification_ids": [ownership["id"]],
 				}],
 			}],
-			"known_gaps": [],
-			"approved_framings": [],
+			"known_gaps": [{
+				"text": "仍需补充交付周期", "fact_ids": [fact["id"]], "clarification_ids": [],
+			}],
+			"approved_framings": [{
+				"text": "未负责整体技术方案", "fact_ids": [],
+				"clarification_ids": [ownership["id"]],
+			}],
 		}, ensure_ascii=False)
 		with patch.object(service, "call_anthropic_text", return_value=composition):
 			status, _, body = self._request(
 				"/api/resume-studio/profile/compose",
 				method="POST",
-				json_body={"external_ai_consent": True},
+				json_body={
+					"external_ai_consent": True,
+					"target_role": "Linux 内核稳定性 / Android BSP",
+				},
 			)
 		self.assertTrue(status.startswith("200"), body)
 		profile = json.loads(body)["profile"]
 		self.assertEqual(profile["fact_count"], 1)
 		self.assertEqual(profile["quality_report"]["evidence_coverage"], 1)
+		self.assertEqual(
+			profile["quality_report"]["target_role"],
+			"Linux 内核稳定性 / Android BSP",
+		)
 
 		status, _, body = self._request(
 			f"/api/resume-studio/profile/versions/{profile['id']}/activate",
@@ -328,6 +340,10 @@ class ResumeStudioApiTests(unittest.TestCase):
 		)
 		self.assertTrue(status.startswith("200"), body)
 		self.assertIn("职业简历档案", body)
+		self.assertIn("我参与 Python 模块实现", body)
+		self.assertNotIn("## 待补充信息", body)
+		self.assertNotIn("## 已确认表达边界", body)
+		self.assertNotIn("仍需补充交付周期", body)
 		self.assertIn("attachment", headers["Content-Disposition"])
 
 	def test_download_and_activation_reject_paths_outside_managed_directories(self):

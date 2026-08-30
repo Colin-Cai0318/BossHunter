@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "description": "Anonymous synthetic cross-profession portfolio samples for Resume Studio evaluation.",
+  "cases": [
+    {
+      "id": "product_manager",
+      "role": "产品经理",
+      "source_kind": "portfolio",
+      "filename": "product_manager_case.md",
+      "title": "新用户激活改进",
+      "source_text": "# 新用户激活改进\n移动应用的新用户在注册后没有完成核心功能，首周留存持续下降。\n我负责梳理激活链路，使用用户访谈、漏斗分析和 A/B 测试重设计新手引导，并协调设计与研发完成上线。\n上线 8 周后，新用户激活率由 42% 提升到 55%，首周留存提高 6 个百分点。",
+      "action_evidence": "我负责梳理激活链路，使用用户访谈、漏斗分析和 A/B 测试重设计新手引导，并协调设计与研发完成上线。",
+      "result_evidence": "上线 8 周后，新用户激活率由 42% 提升到 55%，首周留存提高 6 个百分点。",
+      "method": "A/B 测试"
+    },
+    {
+      "id": "enterprise_sales",
+      "role": "企业销售",
+      "source_kind": "portfolio",
+      "filename": "enterprise_sales_case.md",
+      "title": "华东制造业客户拓展",
+      "source_text": "# 华东制造业客户拓展\n华东制造业客户线索分散，商机跟进缺少统一优先级。\n我负责重点客户拓展，使用 Salesforce 建立客户分层和商机评分，组织售前与交付团队完成方案评审和试点跟进。\n两个季度内完成 18 家重点客户有效拜访，推动 5 个试点并签约 3 家客户。",
+      "action_evidence": "我负责重点客户拓展，使用 Salesforce 建立客户分层和商机评分，组织售前与交付团队完成方案评审和试点跟进。",
+      "result_evidence": "两个季度内完成 18 家重点客户有效拜访，推动 5 个试点并签约 3 家客户。",
+      "method": "Salesforce"
+    },
+    {
+      "id": "clinical_nurse",
+      "role": "临床护士",
+      "source_kind": "portfolio",
+      "filename": "clinical_nurse_case.md",
+      "title": "术后交接质量改进",
+      "source_text": "# 术后交接质量改进\n病区术后患者交接记录不一致，夜班复核需要重复确认关键信息。\n我负责组织交接流程改进，使用 SBAR 标准设计核对表，培训 24 名护理人员并每周抽查记录完整性。\n三个月内交接记录完整率由 81% 提升到 96%，未再发生因交接遗漏导致的重复用药核查。",
+      "action_evidence": "我负责组织交接流程改进，使用 SBAR 标准设计核对表，培训 24 名护理人员并每周抽查记录完整性。",
+      "result_evidence": "三个月内交接记录完整率由 81% 提升到 96%，未再发生因交接遗漏导致的重复用药核查。",
+      "method": "SBAR"
+    },
+    {
+      "id": "middle_school_teacher",
+      "role": "初中数学教师",
+      "source_kind": "portfolio",
+      "filename": "teacher_case.md",
+      "title": "分层教学改进",
+      "source_text": "# 分层教学改进\n班级学生在函数单元的基础差异较大，统一作业无法兼顾不同学习进度。\n我负责函数单元教学改进，使用分层教学和形成性评价设计三档任务，每周根据错题数据调整小组辅导。\n一个学期后，班级函数单元及格率由 72% 提升到 88%，低分段学生人数减少 9 人。",
+      "action_evidence": "我负责函数单元教学改进，使用分层教学和形成性评价设计三档任务，每周根据错题数据调整小组辅导。",
+      "result_evidence": "一个学期后，班级函数单元及格率由 72% 提升到 88%，低分段学生人数减少 9 人。",
+      "method": "分层教学"
+    }
+  ]
+}

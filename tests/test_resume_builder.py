@@ -7,7 +7,9 @@ from pathlib import Path
 from bosshunter.db import get_db
 from bosshunter.resume_builder.service import (
 	MAX_STAR_BATCHES,
+	MAX_STAR_STORIES_PER_BATCH,
 	ResumeBuilderError,
+	_profile_prompt,
 	_star_batches,
 	activate_career_profile,
 	compose_career_profile,
@@ -98,6 +100,60 @@ class ResumeBuilderTests(unittest.TestCase):
 			call_text=caller,
 		)
 
+	def test_cross_profession_samples_extract_without_technical_bias(self):
+		fixture = json.loads(
+			(Path(__file__).parent / "fixtures" / "resume_professions.json").read_text(encoding="utf-8")
+		)
+		for case in fixture["cases"]:
+			with self.subTest(role=case["role"]):
+				source, duplicate = ingest_resume_source(
+					self.connection,
+					filename=case["filename"],
+					content=case["source_text"].encode("utf-8"),
+					storage_dir=self.source_dir,
+				)
+				self.assertFalse(duplicate)
+
+				def caller(prompt, config, max_tokens, sample=case, **kwargs):
+					self.assertIn("职业经历证据抽取器", prompt)
+					self.assertIn("业务案例、服务改进或问题闭环", prompt)
+					return json.dumps({
+						"stories": [{
+							"title": {"text": sample["title"], "evidence": sample["title"]},
+							"situation": None,
+							"task": None,
+							"action": {
+								"text": sample["action_evidence"],
+								"evidence": sample["action_evidence"],
+							},
+							"result": {
+								"text": sample["result_evidence"],
+								"evidence": sample["result_evidence"],
+							},
+							"technologies": [{
+								"name": sample["method"],
+								"evidence": sample["action_evidence"],
+							}],
+							"professional_skills": [],
+							"ownership_level": "responsible",
+							"ownership_evidence": sample["action_evidence"],
+							"confidence": 0.95,
+						}],
+					}, ensure_ascii=False)
+
+				facts = extract_source_facts(
+					self.connection,
+					source["id"],
+					{},
+					source_kind=case["source_kind"],
+					call_text=caller,
+				)
+				self.assertEqual(len(facts), 1)
+				self.assertIn(case["result_evidence"], facts[0]["content"])
+				self.assertEqual(
+					facts[0]["structured_data"]["technologies"][0]["name"], case["method"]
+				)
+
 	def test_database_initializes_resume_studio_tables(self):
 		tables = {
 			row["name"]
@@ -167,6 +223,50 @@ class ResumeBuilderTests(unittest.TestCase):
 		)
 		self.assertEqual(len(facts), 1)
 		self.assertEqual(calls, ["resume_source_star"])
+
+	def test_star_extraction_deduplicates_similar_actions_and_enforces_batch_limit(self):
+		paragraphs = [f"项目 {index}\n执行动作 {index}。" for index in range(1, 5)]
+		paragraphs.extend([
+			(
+				"多连接隔离\n实现命名连接并隔离不同环境的缓存与默认项目。\n"
+				"实现命名连接并隔离不同环境的缓存与默认项目，形成三套环境。"
+			),
+			"额外项目\n执行额外动作。",
+			"溢出项目\n执行溢出动作。",
+		])
+		source = self._source("\n\n".join(paragraphs))
+
+		def story(title: str, action: str) -> dict:
+			return {
+				"title": {"text": title, "evidence": title},
+				"action": {"text": action, "evidence": action},
+				"technologies": [],
+				"professional_skills": [],
+				"ownership_level": "unknown",
+				"ownership_evidence": "",
+				"confidence": 0.9,
+			}
+
+		def caller(prompt, config, max_tokens, **kwargs):
+			return json.dumps({"stories": [
+				*(story(f"项目 {index}", f"执行动作 {index}。") for index in range(1, 5)),
+				story("多连接隔离", "实现命名连接并隔离不同环境的缓存与默认项目。"),
+				story("多环境部署", "实现命名连接并隔离不同环境的缓存与默认项目，形成三套环境。"),
+				story("额外项目", "执行额外动作。"),
+				story("溢出项目", "执行溢出动作。"),
+			]}, ensure_ascii=False)
+
+		facts = extract_source_facts(
+			self.connection,
+			source["id"],
+			{},
+			source_kind="technical_document",
+			call_text=caller,
+		)
+		self.assertEqual(len(facts), MAX_STAR_STORIES_PER_BATCH)
+		self.assertIn("形成三套环境", "\n".join(fact["content"] for fact in facts))
+		self.assertIn("额外动作", "\n".join(fact["content"] for fact in facts))
+		self.assertNotIn("溢出动作", "\n".join(fact["content"] for fact in facts))
 
 	def test_database_migrates_legacy_resume_tables_in_place(self):
 		legacy_path = self.base_dir / "legacy" / "bosshunter.db"
@@ -400,6 +500,75 @@ class ResumeBuilderTests(unittest.TestCase):
 		self.assertEqual(len(stored), 2)
 		self.assertEqual(sum(fact["status"] == "accepted" for fact in stored), 1)
 
+	def test_conflict_question_names_both_values_sources_and_evidence_in_chinese(self):
+		def add_resume(filename: str, position: str) -> None:
+			text = f"# 工作经历\n星云科技 | {position} | 2022-2024"
+			source, duplicate = ingest_resume_source(
+				self.connection,
+				filename=filename,
+				content=text.encode("utf-8"),
+				storage_dir=self.source_dir,
+			)
+			self.assertFalse(duplicate)
+
+			def caller(prompt, config, max_tokens, **kwargs):
+				return json.dumps({
+					"facts": [
+						{
+							"entity_type": "experience",
+							"field_name": "company",
+							"group_id": "work-1",
+							"value": "星云科技",
+							"evidence": f"星云科技 | {position} | 2022-2024",
+							"confidence": 0.99,
+						},
+						{
+							"entity_type": "experience",
+							"field_name": "position",
+							"group_id": "work-1",
+							"value": position,
+							"evidence": f"星云科技 | {position} | 2022-2024",
+							"confidence": 0.99,
+						},
+					]
+				}, ensure_ascii=False)
+
+			facts = extract_source_facts(
+				self.connection,
+				source["id"],
+				{},
+				source_kind="resume",
+				call_text=caller,
+			)
+			for fact in facts:
+				update_fact(self.connection, fact["id"], status="accepted")
+
+		add_resume("校招简历.md", "Python 工程师")
+		add_resume("社招简历.md", "内核稳定性工程师")
+
+		items = refresh_profile_clarifications(self.connection)
+		conflict = next(item for item in items if item["kind"] == "conflict")
+		self.assertIn("职位", conflict["question"])
+		self.assertIn("Python 工程师", conflict["question"])
+		self.assertIn("内核稳定性工程师", conflict["question"])
+		self.assertIn("校招简历.md", conflict["question"])
+		self.assertIn("社招简历.md", conflict["question"])
+		self.assertNotIn("position", conflict["question"])
+		self.assertNotIn("group_id", conflict["question"])
+		self.assertEqual(conflict["metadata"]["entity_label"], "工作经历")
+		self.assertEqual(conflict["metadata"]["field_label"], "职位")
+		options = conflict["metadata"]["conflict_options"]
+		self.assertEqual([option["label"] for option in options], ["选项 1", "选项 2"])
+		self.assertEqual(
+			{source for option in options for source in option["sources"]},
+			{"校招简历.md", "社招简历.md"},
+		)
+		self.assertTrue(all(
+			"公司：星云科技" in detail and "原文：" in detail
+			for option in options for detail in option["details"]
+		))
+		self.assertIn("保留选项 1/2", conflict["metadata"]["answer_guidance"])
+
 	def test_auto_classification_routes_to_resume_extraction(self):
 		source = self._source("# 李雷\n## 教育经历\n清华大学 计算机科学 2020")
 		purposes = []
@@ -607,6 +776,10 @@ class ResumeBuilderTests(unittest.TestCase):
 		self.assertGreaterEqual(len(items), 4)
 		self.assertLessEqual(sum(item["status"] == "open" for item in items), 5)
 		ownership = next(item for item in items if item["kind"] == "ownership")
+		self.assertIn("亲自完成", ownership["question"])
+		self.assertIn("使用 Python", ownership["metadata"]["context"])
+		self.assertIn("贡献等级", ownership["metadata"]["answer_guidance"])
+		self.assertIn("贡献动词", ownership["metadata"]["resume_effect"])
 		update_clarification(
 			self.connection,
 			ownership["id"],
@@ -621,6 +794,8 @@ class ResumeBuilderTests(unittest.TestCase):
 		def caller(prompt, config, max_tokens, **kwargs):
 			self.assertEqual(kwargs["purpose"], "resume_profile_compose")
 			self.assertIn(fact["id"], prompt)
+			self.assertIn("目标岗位：Linux 内核稳定性 / Android BSP", prompt)
+			self.assertIn("目标岗位只能影响事实的选择、排序和篇幅", prompt)
 			return json.dumps({
 				"sections": [],
 				"projects": [{
@@ -634,10 +809,10 @@ class ResumeBuilderTests(unittest.TestCase):
 						"task": "开发本地工具",
 						"action": fact["content"],
 						"result": "2024 年服务 20 名用户",
-						"bullet": fact["content"],
+						"bullet": fact["content"] + "；我参与实现 Python 数据处理模块，未负责整体方案。",
 						"technologies": ["Python", "SQLite"],
 						"fact_ids": [fact["id"]],
-						"clarification_ids": [],
+						"clarification_ids": [ownership["id"]],
 					}],
 				}],
 				"known_gaps": [{
@@ -645,6 +820,98 @@ class ResumeBuilderTests(unittest.TestCase):
 					"fact_ids": [fact["id"]],
 					"clarification_ids": [],
 				}],
+				"approved_framings": [{
+					"text": "未负责整体方案",
+					"fact_ids": [],
+					"clarification_ids": [ownership["id"]],
+				}],
+			}, ensure_ascii=False)
+
+		profile = compose_career_profile(
+			self.connection,
+			{},
+			output_dir=self.base_dir / "data" / "career_profiles",
+			target_role="Linux 内核稳定性 / Android BSP",
+			call_text=caller,
+		)
+		self.assertEqual(profile["fact_count"], 1)
+		self.assertEqual(profile["quality_report"]["evidence_coverage"], 1)
+		self.assertGreater(profile["quality_report"]["prompt_char_count"], 0)
+		self.assertEqual(
+			profile["quality_report"]["target_role"],
+			"Linux 内核稳定性 / Android BSP",
+		)
+		self.assertIn("我参与实现 Python 数据处理模块", profile["markdown"])
+		self.assertNotIn("项目结果仍需补充", profile["markdown"])
+		self.assertNotIn("## 待补充信息", profile["markdown"])
+		self.assertNotIn("## 已确认表达边界", profile["markdown"])
+		self.assertEqual(profile["profile_json"]["known_gaps"][0]["text"], "项目结果仍需补充")
+		self.assertEqual(profile["profile_json"]["approved_framings"][0]["text"], "未负责整体方案")
+		self.assertTrue(Path(profile["json_path"]).exists())
+		self.assertTrue(Path(profile["markdown_path"]).exists())
+		active = activate_career_profile(self.connection, profile["id"])
+		self.assertEqual(active["status"], "active")
+		self.assertEqual(len(list_profile_versions(self.connection)), 1)
+		self.assertTrue(any(item["status"] == "answered" for item in list_clarifications(self.connection)))
+
+	def test_profile_prompt_excludes_answer_bound_to_rejected_fact(self):
+		first_source = self._source()
+		first_fact = self._extract(first_source["id"])[0]
+		update_fact(self.connection, first_fact["id"], status="accepted")
+		ownership = next(
+			item for item in refresh_profile_clarifications(self.connection)
+			if item["kind"] == "ownership"
+		)
+		update_clarification(
+			self.connection,
+			ownership["id"],
+			status="answered",
+			answer="我负责该模块。",
+		)
+		update_fact(self.connection, first_fact["id"], status="rejected")
+
+		second_source = self._source(
+			"项目 Beta\n使用 Python 和 SQLite 开发本地工具，2024 年服务 20 名用户。"
+		)
+		second_fact = self._extract(second_source["id"])[0]
+		update_fact(self.connection, second_fact["id"], status="accepted")
+		prompt = _profile_prompt(
+			list_facts(self.connection, status="accepted"),
+			list_clarifications(self.connection),
+		)
+		self.assertNotIn(ownership["id"], prompt)
+		self.assertNotIn("我负责该模块", prompt)
+
+	def test_profile_repairs_draft_that_ignores_confirmed_answer(self):
+		source = self._source()
+		fact = self._extract(source["id"])[0]
+		update_fact(self.connection, fact["id"], status="accepted")
+		ownership = next(
+			item for item in refresh_profile_clarifications(self.connection)
+			if item["kind"] == "ownership"
+		)
+		answer = "我负责数据处理模块，并完成异常数据校验。"
+		update_clarification(
+			self.connection, ownership["id"], status="answered", answer=answer,
+		)
+		calls = []
+
+		def caller(prompt, config, max_tokens, **kwargs):
+			calls.append(prompt)
+			include_answer = len(calls) > 1
+			bullet = fact["content"] + ("；" + answer if include_answer else "")
+			clarification_ids = [ownership["id"]] if include_answer else []
+			return json.dumps({
+				"sections": [],
+				"projects": [{
+					"title": "项目 Alpha", "meta": "", "fact_ids": [fact["id"]],
+					"clarification_ids": [], "stars": [{
+						"action": bullet, "bullet": bullet,
+						"fact_ids": [fact["id"]],
+						"clarification_ids": clarification_ids,
+					}],
+				}],
+				"known_gaps": [],
 				"approved_framings": [],
 			}, ensure_ascii=False)
 
@@ -654,16 +921,11 @@ class ResumeBuilderTests(unittest.TestCase):
 			output_dir=self.base_dir / "data" / "career_profiles",
 			call_text=caller,
 		)
-		self.assertEqual(profile["fact_count"], 1)
-		self.assertEqual(profile["quality_report"]["evidence_coverage"], 1)
-		self.assertTrue(Path(profile["json_path"]).exists())
-		self.assertTrue(Path(profile["markdown_path"]).exists())
-		active = activate_career_profile(self.connection, profile["id"])
-		self.assertEqual(active["status"], "active")
-		self.assertEqual(len(list_profile_versions(self.connection)), 1)
-		self.assertTrue(any(item["status"] == "answered" for item in list_clarifications(self.connection)))
+		self.assertEqual(len(calls), 2)
+		self.assertIn("职业档案未融合已确认回答", calls[1])
+		self.assertIn(answer, profile["markdown"])
 
-	def test_profile_rejects_new_metric(self):
+	def test_profile_drops_new_metric_after_failed_repair(self):
 		source = self._source()
 		fact = self._extract(source["id"])[0]
 		update_fact(self.connection, fact["id"], status="accepted")
@@ -680,13 +942,15 @@ class ResumeBuilderTests(unittest.TestCase):
 				}],
 			}, ensure_ascii=False)
 
-		with self.assertRaisesRegex(ResumeBuilderError, "无来源事实"):
-			compose_career_profile(
-				self.connection,
-				{},
-				output_dir=self.base_dir / "data" / "career_profiles",
-				call_text=caller,
-			)
+		profile = compose_career_profile(
+			self.connection,
+			{},
+			output_dir=self.base_dir / "data" / "career_profiles",
+			call_text=caller,
+		)
+		self.assertNotIn("88%", profile["markdown"])
+		self.assertIn(fact["content"], profile["markdown"])
+		self.assertGreater(profile["quality_report"]["validation_warning_count"], 0)
 
 	def test_profile_groups_multiple_stars_under_one_project_heading(self):
 		source = self._source()
@@ -723,7 +987,54 @@ class ResumeBuilderTests(unittest.TestCase):
 		self.assertIn("**Python**", profile["markdown"])
 		self.assertIn("**SQLite**", profile["markdown"])
 
-	def test_profile_rejects_new_technology_name(self):
+	def test_profile_splits_project_generation_by_source(self):
+		first_source = self._source()
+		first_fact = self._extract(first_source["id"])[0]
+		update_fact(self.connection, first_fact["id"], status="accepted")
+		second_source = self._source(
+			"\u9879\u76ee Alpha\n\u4f7f\u7528 Python \u548c SQLite \u5f00\u53d1\u672c\u5730\u5de5\u5177\uff0c2024 \u5e74\u670d\u52a1 20 \u540d\u7528\u6237\u3002\ncopy"
+		)
+		second_fact = self._extract(second_source["id"])[0]
+		update_fact(self.connection, second_fact["id"], status="accepted")
+		calls = []
+
+		def caller(prompt, config, max_tokens, **kwargs):
+			calls.append((prompt, max_tokens))
+			fact = first_fact if first_fact["id"] in prompt else second_fact
+			return json.dumps({
+				"sections": [],
+				"projects": [{
+					"title": fact["source_filename"].removesuffix(".md"),
+					"meta": "",
+					"fact_ids": [fact["id"]],
+					"clarification_ids": [],
+					"stars": [{
+						"action": fact["content"],
+						"bullet": fact["content"],
+						"fact_ids": [fact["id"]],
+						"clarification_ids": [],
+					}],
+				}],
+			}, ensure_ascii=False)
+
+		profile = compose_career_profile(
+			self.connection,
+			{},
+			output_dir=self.base_dir / "data" / "career_profiles",
+			call_text=caller,
+		)
+		self.assertEqual(len(calls), 2)
+		self.assertTrue(all(max_tokens == 3200 for _, max_tokens in calls))
+		self.assertEqual(profile["quality_report"]["prompt_request_count"], 2)
+		self.assertEqual(profile["fact_count"], 2)
+
+	def test_profile_prompt_treats_source_filename_as_grouping_not_default_title(self):
+		prompt = _profile_prompt([], [], focus="projects")
+		self.assertIn("source_filename 只用于归并，不是默认项目标题", prompt)
+		self.assertIn("*_case", prompt)
+		self.assertIn("structured_data.title", prompt)
+
+	def test_profile_project_title_can_use_managed_source_filename(self):
 		source = self._source()
 		fact = self._extract(source["id"])[0]
 		update_fact(self.connection, fact["id"], status="accepted")
@@ -732,21 +1043,63 @@ class ResumeBuilderTests(unittest.TestCase):
 			return json.dumps({
 				"sections": [],
 				"projects": [{
+					"title": "技术作品",
+					"meta": "",
+					"fact_ids": [fact["id"]],
+					"clarification_ids": [],
+					"stars": [{
+						"action": fact["content"],
+						"bullet": fact["content"],
+						"fact_ids": [fact["id"]],
+						"clarification_ids": [],
+					}],
+				}],
+			}, ensure_ascii=False)
+
+		profile = compose_career_profile(
+			self.connection,
+			{},
+			output_dir=self.base_dir / "data" / "career_profiles",
+			call_text=caller,
+		)
+		self.assertIn("### 技术作品", profile["markdown"])
+		self.assertEqual(profile["quality_report"]["validation_warning_count"], 0)
+
+	def test_profile_drops_unsupported_terms_after_failed_repair(self):
+		source = self._source()
+		fact = self._extract(source["id"])[0]
+		update_fact(self.connection, fact["id"], status="accepted")
+
+		def caller(prompt, config, max_tokens, **kwargs):
+			unsupported = (
+				"Authorization Basic Cookie JSON.parse Mock PASS header query request "
+				"searchType totalCount true"
+			)
+			return json.dumps({
+				"sections": [],
+				"projects": [{
 					"title": "项目 Alpha", "meta": "", "fact_ids": [fact["id"]],
 					"clarification_ids": [], "stars": [{
-						"action": "使用 Rust 开发本地工具", "bullet": "使用 Rust 开发本地工具",
+						"action": unsupported, "bullet": unsupported,
 						"fact_ids": [fact["id"]], "clarification_ids": [],
 					}],
 				}],
 			}, ensure_ascii=False)
 
-		with self.assertRaisesRegex(ResumeBuilderError, "无来源事实"):
-			compose_career_profile(
-				self.connection,
-				{},
-				output_dir=self.base_dir / "data" / "career_profiles",
-				call_text=caller,
-			)
+		profile = compose_career_profile(
+			self.connection,
+			{},
+			output_dir=self.base_dir / "data" / "career_profiles",
+			call_text=caller,
+		)
+		for token in ("Authorization", "Basic", "Cookie", "JSON.parse", "searchType", "totalCount"):
+			self.assertNotIn(token, profile["markdown"])
+		self.assertIn(fact["content"], profile["markdown"])
+		self.assertGreater(profile["quality_report"]["validation_warning_count"], 0)
+		self.assertTrue(any(
+			"职业档案包含无来源事实" in warning
+			for warning in profile["quality_report"]["validation_warnings"]
+		))
 
 	def test_profile_repairs_unsupported_token_without_relaxing_validation(self):
 		source = self._source()

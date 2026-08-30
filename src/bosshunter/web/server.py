@@ -72,6 +72,7 @@ from bosshunter.resume_builder import (
 	delete_resume_source,
 	extract_source_facts,
 	ingest_resume_source,
+	render_career_profile_markdown,
 	refresh_profile_clarifications,
 )
 from bosshunter.resume_builder.store import (
@@ -2169,12 +2170,15 @@ def api_resume_delete():
 # ─── Resume Studio APIs ──────────────────────────────────
 
 def _resume_studio_payload(db):
+	profiles = list_profile_versions(db)
+	for profile in profiles:
+		profile["markdown"] = render_career_profile_markdown(profile.get("profile_json") or {})
 	return {
 		"sources": list_sources(db),
 		"facts": list_facts(db),
 		"versions": list_versions(db),
 		"clarifications": list_clarifications(db),
-		"profile_versions": list_profile_versions(db),
+		"profile_versions": profiles,
 	}
 
 
@@ -2403,10 +2407,12 @@ def api_resume_studio_profile_compose():
 	db = _get_web_db()
 	try:
 		_require_external_ai_consent(body)
+		target_role = str(body.get("target_role") or "").strip()[:100]
 		profile = compose_career_profile(
 			db,
 			load_config(CONFIG_PATH),
 			output_dir=CAREER_PROFILE_DIR,
+			target_role=target_role,
 		)
 		return _json_response({"success": True, "profile": profile})
 	except ResumeBuilderError as exc:
@@ -2432,6 +2438,14 @@ def api_resume_studio_profile_activate(profile_id):
 			profile["markdown_path"], CAREER_PROFILE_DIR, prefix + ".md"
 		)
 		_managed_generated_file(profile["json_path"], CAREER_PROFILE_DIR, prefix + ".json")
+		clean_markdown = render_career_profile_markdown(profile.get("profile_json") or {})
+		temporary = markdown_path.with_name("." + markdown_path.name + ".tmp")
+		try:
+			temporary.write_text(clean_markdown, encoding="utf-8")
+			temporary.replace(markdown_path)
+		finally:
+			temporary.unlink(missing_ok=True)
+		profile["markdown"] = clean_markdown
 		config = load_config(CONFIG_PATH)
 		config.setdefault("profile", {})["resume_path"] = str(markdown_path)
 		_write_config(config)
@@ -2457,7 +2471,11 @@ def api_resume_studio_profile_download(profile_id):
 		path = _managed_generated_file(
 			profile[path_key], CAREER_PROFILE_DIR, "career_profile_" + profile_id[:12] + suffix
 		)
-		return static_file(path.name, root=str(path.parent), download=path.name)
+		if path_key == "json_path":
+			return static_file(path.name, root=str(path.parent), download=path.name)
+		response.content_type = "text/markdown; charset=UTF-8"
+		response.set_header("Content-Disposition", f'attachment; filename="{path.name}"')
+		return render_career_profile_markdown(profile.get("profile_json") or {})
 	except ResumeBuilderError as exc:
 		return _json_response({"error": str(exc)}, 409)
 	finally:
