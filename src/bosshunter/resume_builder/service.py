@@ -43,7 +43,9 @@ DEFAULT_CHUNK_CHARS = 12_000
 STAR_BATCH_CHARS = 12_000
 RESUME_BATCH_CHARS = 30_000
 MAX_STAR_BATCHES = 4
+MAX_STAR_STORIES_PER_BATCH = 6
 MAX_PROFILE_QUESTIONS = 5
+MAX_TARGET_RESUME_PROJECTS = 4
 FACT_CATEGORIES = {
 	"基本信息",
 	"个人优势",
@@ -75,6 +77,18 @@ RESUME_ENTITY_TYPES = {
 	"award",
 	"publication",
 	"other",
+}
+RESUME_ENTITY_LABELS = {
+	"identity": "基本信息",
+	"contact": "联系方式",
+	"experience": "工作经历",
+	"project": "项目经历",
+	"education": "教育经历",
+	"skill": "专业能力",
+	"certification": "证书",
+	"award": "奖项",
+	"publication": "公开成果",
+	"other": "其他经历",
 }
 RESUME_FIELD_CATEGORIES = {
 	"name": "基本信息",
@@ -113,6 +127,8 @@ RESUME_FIELD_LABELS = {
 	"position": "职位",
 	"start_date": "开始时间",
 	"end_date": "结束时间",
+	"responsibility": "职责",
+	"achievement": "成果",
 	"project_name": "项目",
 	"role": "角色",
 	"technology": "技术",
@@ -123,6 +139,8 @@ RESUME_FIELD_LABELS = {
 	"award": "奖项",
 	"publication": "公开成果",
 	"language": "语言",
+	"summary": "个人总结",
+	"other": "其他信息",
 }
 RESUME_NARRATIVE_FIELDS = {"responsibility", "achievement", "summary", "other"}
 STAR_COMPONENTS = ("situation", "task", "action", "result")
@@ -160,11 +178,19 @@ def _structured_tokens(text: str) -> set[str]:
 def _unsupported_tokens(candidate: str, evidence: str) -> list[str]:
 	supported = _structured_tokens(evidence)
 	unsupported = {token for token in _structured_tokens(candidate) if token not in supported}
-	evidence_names = {match.group(0).casefold() for match in _NAMED_TOKEN_PATTERN.finditer(evidence)}
+	named_evidence = re.sub(
+		r"(?<=[A-Za-z0-9.+#/_-])(?=[^\x00-\x7F])|(?<=[^\x00-\x7F])(?=[A-Za-z])",
+		" ",
+		evidence,
+	)
+	evidence_names = {
+		match.group(0).casefold().strip("._/-")
+		for match in _NAMED_TOKEN_PATTERN.finditer(named_evidence)
+	}
 	unsupported.update(
 		match.group(0)
 		for match in _NAMED_TOKEN_PATTERN.finditer(candidate)
-		if match.group(0).casefold() not in evidence_names
+		if match.group(0).casefold().strip("._/-") not in evidence_names
 	)
 	return sorted(unsupported)
 
@@ -500,23 +526,23 @@ def _star_prompt(source: dict, source_kind: str, chunk: str, index: int, *, stri
 严格重试规则：
 - text 可以直接等于 evidence，evidence 必须从原文逐字复制，禁止概括证据。
 - 文档只描述系统或团队动作时仍可抽取 Action，但 ownership_level 必须为 unknown。
-- 最多返回 3 条最有技术含量的故事，使用最短连续证据，优先保证 JSON 完整和证据准确。
+- 最多返回 6 条互不重复且最能体现职业价值的故事，使用最短连续证据，优先保证 JSON 完整和证据准确。
 """ if strict else ""
-	return f"""你是技术经历证据抽取器。材料类型是{SOURCE_KIND_LABELS[source_kind]}。
+	return f"""你是职业经历证据抽取器。材料类型是{SOURCE_KIND_LABELS[source_kind]}。
 
-请识别本分片中一个或多个相互独立的项目、作品或问题，并用 STAR 拆解。
+请识别本分片中一个或多个相互独立的项目、作品、业务案例、服务改进或问题闭环，并用 STAR 拆解。
 
 规则：
 1. 每个 situation/task/action/result 都输出 text 和逐字 evidence；没有明确信息时使用 null。
-2. action 重点说明本人使用什么技术、方法或专业能力解决了什么问题。
+2. action 重点说明本人使用什么工具、技术、方法、流程或专业能力解决了什么问题。
 3. 文档只说明团队或系统方案、没有个人贡献时，ownership_level 必须是 unknown。
 4. ownership_level 只能是 unknown、participated、collaborated、responsible、led。
 5. 不得补充原文没有的数字、结果、技术或个人职责。
-6. technologies 中 name 必须逐字出现在对应 evidence 中。
+6. technologies 可记录原文明示的工具、技术、系统、标准或方法；name 必须逐字出现在对应 evidence 中。
 7. professional_skills 可以根据明确动作归纳，但必须标记 derived=true 并附原文 evidence。
 8. evidence 必须从原文逐字复制，禁止概括；text 可以直接等于 evidence。
 9. 文档只描述系统或团队动作时仍可抽取 Action，但 ownership_level 必须为 unknown。
-10. 每个分片最多返回 3 条最有技术含量的故事，优先保证 JSON 完整。
+10. 每个分片最多返回 6 条互不重复且最能体现职业价值的故事。优先保留有证据的关键职责、问题解决、流程改进、交付、客户/用户影响、质量安全、团队采用、覆盖范围或真实案例闭环；不要用技术复杂度作为唯一选择标准。
 11. 每个 text 最多 240 个字符；每个 evidence 只复制能直接支撑字段的最短连续原文，最多 400 个字符。原文中的双引号、反斜杠和换行必须按 JSON 标准转义。
 12. 只输出 JSON：
 {{"stories":[{{
@@ -579,14 +605,43 @@ def _extract_star_candidates(
 	strict: bool = True,
 	allow_zero_retry: bool = True,
 ) -> list[dict]:
+	def deduplicate_batch(values: list[dict]) -> list[dict]:
+		result: list[dict] = []
+		for candidate in values:
+			data = candidate.get("structured_data") or {}
+			title = _clean_whitespace(str(data.get("title", ""))).casefold()
+			action = _clean_whitespace(
+				str((data.get("action") or {}).get("text", ""))
+			).casefold().rstrip("。；;,.，")
+			duplicate_index = None
+			for existing_index, existing in enumerate(result):
+				existing_data = existing.get("structured_data") or {}
+				existing_title = _clean_whitespace(str(existing_data.get("title", ""))).casefold()
+				existing_action = _clean_whitespace(
+					str((existing_data.get("action") or {}).get("text", ""))
+				).casefold().rstrip("。；;,.，")
+				action_overlap = action and existing_action and (
+					action in existing_action or existing_action in action
+				)
+				same_story = title == existing_title or min(len(action), len(existing_action)) >= 20
+				if action_overlap and same_story:
+					duplicate_index = existing_index
+					if len(action) > len(existing_action):
+						result[existing_index] = candidate
+					break
+			if duplicate_index is None:
+				result.append(candidate)
+		return result
+
 	candidates: list[dict] = []
 	seen: set[str] = set()
 	for index, chunk in enumerate(_star_batches(source["normalized_text"]), start=1):
+		batch_start = len(candidates)
 		payload = _request_json_payload(
 			caller,
 			_star_prompt(source, source_kind, chunk, index, strict=strict),
 			config,
-			3500,
+			5000,
 			purpose="resume_source_star",
 			empty_message="AI 服务未返回 STAR 抽取结果",
 		)
@@ -673,6 +728,9 @@ def _extract_star_candidates(
 				"needs_clarification": bool(missing_fields),
 				"evidence_items": evidence_items,
 			})
+		batch_candidates = deduplicate_batch(candidates[batch_start:])
+		candidates[batch_start:] = batch_candidates[:MAX_STAR_STORIES_PER_BATCH]
+	candidates = deduplicate_batch(candidates)
 	if not candidates and allow_zero_retry:
 		return _extract_star_candidates(
 			source,
@@ -762,6 +820,45 @@ def extract_source_facts(
 		raise
 
 
+def _resume_fact_value(fact: dict) -> str:
+	data = fact.get("structured_data")
+	if isinstance(data, dict) and data.get("value"):
+		return _clean_whitespace(str(data["value"]))[:160]
+	return _clean_whitespace(str(fact.get("effective_content") or ""))[:160]
+
+
+def _clarification_experience_label(fact: dict, facts: list[dict], excluded_field: str) -> str:
+	entity_type = str(fact.get("entity_type") or "other")
+	preferred_fields = {
+		"identity": ("name", "headline"),
+		"contact": ("name", "email", "phone"),
+		"experience": ("company", "position", "start_date", "end_date"),
+		"project": ("project_name", "role", "start_date", "end_date"),
+		"education": ("school", "degree", "major", "start_date", "end_date"),
+		"skill": ("technology",),
+		"certification": ("certification",),
+		"award": ("award",),
+		"publication": ("publication",),
+	}.get(entity_type, ())
+	parts: list[str] = []
+	for field_name in preferred_fields:
+		if field_name == excluded_field:
+			continue
+		match = next((
+			candidate for candidate in facts
+			if candidate.get("source_id") == fact.get("source_id")
+			and candidate.get("entity_type") == fact.get("entity_type")
+			and candidate.get("group_id") == fact.get("group_id")
+			and candidate.get("field_name") == field_name
+		), None)
+		if not match:
+			continue
+		value = _resume_fact_value(match)
+		if value:
+			parts.append(f"{RESUME_FIELD_LABELS.get(field_name, field_name)}：{value}")
+	return "；".join(parts)[:240] or RESUME_ENTITY_LABELS.get(entity_type, "简历经历")
+
+
 def refresh_profile_clarifications(conn: sqlite3.Connection) -> list[dict]:
 	"""Build a deterministic queue of high-value questions from accepted facts."""
 	facts = list_facts(conn, status="accepted")
@@ -780,26 +877,57 @@ def refresh_profile_clarifications(conn: sqlite3.Connection) -> list[dict]:
 			continue
 		data = fact["structured_data"]
 		title = _clean_whitespace(str(data.get("title") or fact["source_filename"]))[:120]
+		action = data.get("action") if isinstance(data.get("action"), dict) else {}
+		result = data.get("result") if isinstance(data.get("result"), dict) else {}
+		action_text = _clean_whitespace(str(action.get("text") or fact["effective_content"]))[:240]
+		result_text = _clean_whitespace(str(result.get("text") or ""))[:180]
+		context = action_text or _clean_whitespace(str(fact["effective_content"]))[:240]
 		missing = {str(value) for value in data.get("missing_fields", [])}
+		question_specs = {
+			"situation": (
+				"这段经历缺少“背景或限制”。当时服务的是哪类业务或用户，遇到了什么具体限制（例如时间、质量、资源或合规）？没有可公开信息时请回答“无可公开信息”。",
+				"按“业务/用户场景 + 一项具体限制 + 为什么必须处理”回答。",
+				"回答会写入这条经历的背景，让招聘者先理解问题为什么重要。",
+			),
+			"task": (
+				"这段经历缺少“你的任务”。你本人需要解决哪个具体问题，或交付什么结果？请同时说明你的负责范围；没有明确个人任务时回答“无明确个人任务”。",
+				"按“要解决的问题或交付物 + 我的负责范围”回答，不要只重复项目名称。",
+				"回答会写入这条经历的任务，并用于区分团队目标和你的个人职责。",
+			),
+			"result": (
+				"这段经历缺少“完成后的结果”。上述动作最终带来了什么可验证变化？可以填写交付、采用、覆盖、效率、质量或问题闭环；没有统计时回答“未统计”。",
+				"按“发生了什么变化 + 适用对象或时间 + 如何验证”回答，定性结果也可以。",
+				"回答会直接写入这条经历的结果，不会作为备注附在简历末尾。",
+			),
+		}
 		for component in sorted(missing - {"ownership"}):
-			labels = {"situation": "背景", "task": "个人任务", "result": "结果"}
-			label = labels.get(component, component)
+			question, answer_guidance, resume_effect = question_specs.get(
+				component,
+				("这段经历还缺少一项必要信息。请根据当前事实补充；没有或无法确认时直接说明。", "只填写你能确认、能在面试中解释的信息。", "回答会用于完善当前这条经历。"),
+			)
 			items.append({
 				"fact_id": fact["id"],
 				"dedupe_key": f"{fact['id']}:missing:{component}",
 				"kind": f"missing_{component}",
-				"question": f"「{title}」缺少明确的{label}。请补充本人可在面试中说明的真实信息；没有则回答“无”。",
+				"question": f"「{title}」：{question}",
 				"priority": 90 if component == "result" else 70,
-				"metadata": {"component": component, "title": title},
+				"metadata": {
+					"component": component, "title": title, "context": context,
+					"answer_guidance": answer_guidance, "resume_effect": resume_effect,
+				},
 			})
 		if data.get("ownership_level") == "unknown" or "ownership" in missing:
 			items.append({
 				"fact_id": fact["id"],
 				"dedupe_key": f"{fact['id']}:ownership",
 				"kind": "ownership",
-				"question": f"「{title}」尚未证明个人贡献。你在其中是参与、协作、负责还是主导？请说明本人具体动作。",
+				"question": f"「{title}」目前只记录了团队或系统动作，缺少你的个人贡献。请选择参与、协作、负责或主导，并写出你亲自完成的 1—3 个动作。",
 				"priority": 100,
-				"metadata": {"title": title},
+				"metadata": {
+					"title": title, "context": context,
+					"answer_guidance": "按“贡献等级 + 我亲自完成的动作 + 我未负责的范围（如有）”回答，不要只写“负责”。",
+					"resume_effect": "回答会决定这条经历使用“参与、协作、负责、主导”中的哪个贡献动词。",
+				},
 			})
 		for skill in data.get("professional_skills", []):
 			if not isinstance(skill, dict) or not skill.get("derived"):
@@ -811,37 +939,100 @@ def refresh_profile_clarifications(conn: sqlite3.Connection) -> list[dict]:
 				"fact_id": fact["id"],
 				"dedupe_key": f"{fact['id']}:skill:{name.casefold()}",
 				"kind": "derived_skill",
-				"question": f"系统根据「{title}」的动作归纳出专业技能“{name}”。是否认可，并能在面试中解释？",
+				"question": f"根据「{title}」中的现有动作，系统推测你具备“{name}”。你是否认可？如果认可，请说明你在这段经历中如何使用了它。",
 				"priority": 60,
-				"metadata": {"title": title, "skill": name},
+				"metadata": {
+					"title": title, "skill": name, "context": context,
+					"answer_guidance": "先回答“认可”或“不认可”；认可时再补充一个可由当前经历证明的具体动作。",
+					"resume_effect": "认可后该能力才可进入专业能力或相关 STAR。",
+				},
 			})
-		result = data.get("result")
-		if isinstance(result, dict) and _structured_tokens(str(result.get("text", ""))):
+		if result_text and _structured_tokens(result_text):
 			items.append({
 				"fact_id": fact["id"],
 				"dedupe_key": f"{fact['id']}:metric_source",
 				"kind": "metric_source",
-				"question": f"「{title}」包含量化结果。请说明数据口径、时间范围或可验证来源；不确定时请明确说明。",
+				"question": f"「{title}」写到量化结果“{result_text}”。这个数字统计的是哪个时间范围、哪些对象，依据来自哪里？",
 				"priority": 80,
-				"metadata": {"title": title},
+				"metadata": {
+					"title": title, "context": result_text,
+					"answer_guidance": "按“时间范围 + 统计对象 + 数据来源”回答；无法核实时直接回答“无法核实”。",
+					"resume_effect": "回答会决定这个数字是否保留，以及简历中如何说明它的统计口径。",
+				},
 			})
 
 	for (entity_type, group_id, field_name), grouped in resume_groups.items():
-		values = {str(fact["effective_content"]).strip().casefold() for fact in grouped}
-		if len(values) <= 1:
+		value_groups: dict[str, dict] = {}
+		for fact in grouped:
+			value = _resume_fact_value(fact)
+			if not value:
+				continue
+			entry = value_groups.setdefault(value.casefold(), {"value": value, "facts": []})
+			entry["facts"].append(fact)
+		if len(value_groups) <= 1:
 			continue
 		fact_ids = [fact["id"] for fact in grouped]
+		conflict_options: list[dict] = []
+		for index, entry in enumerate(value_groups.values(), start=1):
+			sources: list[str] = []
+			details: list[str] = []
+			for grouped_fact in entry["facts"]:
+				source_filename = str(grouped_fact.get("source_filename") or "未命名材料")
+				if source_filename not in sources:
+					sources.append(source_filename)
+				experience_label = _clarification_experience_label(
+					grouped_fact, facts, field_name
+				)
+				evidence = _clean_whitespace(str(
+					grouped_fact.get("evidence") or grouped_fact.get("effective_content") or ""
+				))[:240]
+				detail = f"材料《{source_filename}》中的{experience_label}"
+				if evidence:
+					detail += f"；原文：{evidence}"
+				if detail not in details:
+					details.append(detail)
+			conflict_options.append({
+				"label": f"选项 {index}",
+				"value": entry["value"],
+				"sources": sources,
+				"details": details,
+			})
+		entity_label = RESUME_ENTITY_LABELS.get(entity_type, "简历经历")
+		field_label = RESUME_FIELD_LABELS.get(field_name, "信息")
+		option_summary = "；".join(
+			f"{option['label']}“{option['value']}”（来源：{'、'.join(option['sources'])}）"
+			for option in conflict_options
+		)
 		items.append({
 			"fact_id": fact_ids[0],
 			"dedupe_key": f"conflict:{entity_type}:{group_id}:{field_name}",
 			"kind": "conflict",
-			"question": f"同一经历的“{field_name}”存在多个已接受值。请确认应保留哪个，或说明它们是否属于不同经历。",
+			"question": (
+				f"系统把以下 {len(conflict_options)} 种“{field_label}”写法归入同一段{entity_label}，"
+				f"但内容不一致：{option_summary}。请确认应保留哪个选项；"
+				"如果都正确，请说明每个选项分别属于哪段经历。"
+			),
 			"priority": 95,
 			"metadata": {
 				"entity_type": entity_type,
+				"entity_label": entity_label,
 				"group_id": group_id,
 				"field_name": field_name,
+				"field_label": field_label,
 				"fact_ids": fact_ids,
+				"conflict_options": conflict_options,
+				"context": "\n".join(
+					f"{option['label']}｜{field_label}：{option['value']}｜{'；'.join(option['details'])}"
+					for option in conflict_options
+				),
+				"answer_guidance": (
+					"直接回答“保留选项 1/2”；如果都要保留，请写成"
+					"“选项 1 属于哪家公司、项目或时间，选项 2 属于哪一段经历”。"
+				),
+				"resume_effect": (
+					f"回答会决定简历中{entity_label}的“{field_label}”如何归属，"
+					"避免把不同经历错误合并。"
+				),
 			},
 		})
 	resolved_keys = {
@@ -854,7 +1045,60 @@ def refresh_profile_clarifications(conn: sqlite3.Connection) -> list[dict]:
 	return replace_open_clarifications(conn, unresolved[:MAX_PROFILE_QUESTIONS])
 
 
-def _profile_prompt(facts: list[dict], clarifications: list[dict]) -> str:
+def _select_profile_prompt_facts(facts: list[dict], target_role: str) -> list[dict]:
+	if not _clean_whitespace(target_role):
+		return facts
+	project_groups: dict[tuple[str, str], list[dict]] = {}
+	for fact in facts:
+		if fact.get("fact_type") == "resume_field" and fact.get("entity_type") == "project":
+			key = (str(fact.get("source_filename") or ""), str(fact.get("group_id") or fact["id"]))
+			project_groups.setdefault(key, []).append(fact)
+	if len(project_groups) <= MAX_TARGET_RESUME_PROJECTS:
+		return facts
+
+	role_text = _clean_whitespace(target_role).casefold()
+	role_tokens = set(re.findall(r"[a-z0-9+#.-]{2,}|[\u4e00-\u9fff]{2,}", role_text))
+	for token in list(role_tokens):
+		if re.fullmatch(r"[\u4e00-\u9fff]{3,}", token):
+			role_tokens.update(token[index:index + size] for size in (2, 3) for index in range(len(token) - size + 1))
+
+	def group_score(group: list[dict]) -> tuple[int, int, int, str]:
+		text = " ".join(str(fact.get("effective_content") or "") for fact in group).casefold()
+		readable = int("***" not in text)
+		relevance = sum(len(token) for token in role_tokens if token in text)
+		latest_date = max(
+			(str(fact.get("effective_content") or "") for fact in group if fact.get("field_name") == "start_date"),
+			default="",
+		)
+		return readable, relevance, len(group), latest_date
+
+	selected_groups = {
+		key for key, _ in sorted(
+			project_groups.items(),
+			key=lambda item: group_score(item[1]),
+			reverse=True,
+		)[:MAX_TARGET_RESUME_PROJECTS]
+	}
+	return [
+		fact for fact in facts
+		if not (
+			fact.get("fact_type") == "resume_field"
+			and fact.get("entity_type") == "project"
+			and (
+				str(fact.get("source_filename") or ""),
+				str(fact.get("group_id") or fact["id"]),
+			) not in selected_groups
+		)
+	]
+
+
+def _profile_prompt(
+	facts: list[dict],
+	clarifications: list[dict],
+	target_role: str = "",
+	*,
+	focus: str = "all",
+) -> str:
 	def compact_structure(fact: dict) -> dict | None:
 		data = fact.get("structured_data")
 		if not isinstance(data, dict):
@@ -878,46 +1122,101 @@ def _profile_prompt(facts: list[dict], clarifications: list[dict]) -> str:
 				result[key] = component["text"]
 		return result
 
-	public_facts = [
-		{
-			"id": fact["id"],
-			"category": fact["category"],
-			"fact_type": fact.get("fact_type"),
-			"entity_type": fact.get("entity_type"),
-			"field_name": fact.get("field_name"),
-			"group_id": fact.get("group_id"),
-			"source_filename": fact.get("source_filename"),
-			"content": fact["effective_content"],
-			"structured_data": compact_structure(fact),
-		}
-		for fact in facts
-	]
-	public_answers = [
-		{
-			"id": item["id"],
-			"fact_id": item.get("fact_id"),
-			"kind": item["kind"],
-			"answer": item["answer"],
-		}
-		for item in clarifications
-		if item.get("status") == "answered" and item.get("answer")
-	]
+	public_facts: list[dict] = []
+	resume_entities: dict[tuple[str, str, str], dict] = {}
+	for fact in facts:
+		if fact.get("fact_type") != "resume_field":
+			public_facts.append({
+				"type": "star_story",
+				"id": fact["id"],
+				"group_id": fact.get("group_id"),
+				"source_filename": fact.get("source_filename"),
+				"structured_data": compact_structure(fact),
+			})
+			continue
+		entity_type = str(fact.get("entity_type") or "other")
+		group_id = str(fact.get("group_id") or fact["id"])
+		source_filename = str(fact.get("source_filename") or "")
+		key = (source_filename, entity_type, group_id)
+		entity = resume_entities.setdefault(key, {
+			"type": "resume_entity",
+			"entity_type": entity_type,
+			"group_id": group_id,
+			"source_filename": source_filename,
+			"fields": [],
+		})
+		entity["fields"].append([
+			fact["id"],
+			fact.get("field_name"),
+			(compact_structure(fact) or {}).get("value"),
+		])
+	public_facts.extend(resume_entities.values())
+
+	grouped_answers: dict[tuple[str, str], dict] = {}
+	accepted_fact_ids = {str(fact["id"]) for fact in facts}
+	for item in clarifications:
+		if item.get("status") != "answered" or not item.get("answer"):
+			continue
+		metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+		linked_fact_ids = [str(item["fact_id"])] if item.get("fact_id") else []
+		linked_fact_ids.extend(str(value) for value in metadata.get("fact_ids", []))
+		linked_fact_ids = [value for value in dict.fromkeys(linked_fact_ids) if value in accepted_fact_ids]
+		if item.get("fact_id") and not linked_fact_ids:
+			continue
+		answer = _clean_whitespace(str(item["answer"]))
+		if item.get("kind") == "derived_skill":
+			answer = re.split(r"[，；]", answer, maxsplit=1)[0]
+		key = (str(item.get("kind") or "confirmation"), answer.casefold())
+		grouped = grouped_answers.setdefault(key, {
+			"ids": [],
+			"fact_ids": [],
+			"kind": key[0],
+			"answer": answer,
+		})
+		grouped["ids"].append(item["id"])
+		grouped["fact_ids"].extend(linked_fact_ids)
+	public_answers = []
+	for item in grouped_answers.values():
+		item["ids"] = list(dict.fromkeys(item["ids"]))
+		item["fact_ids"] = list(dict.fromkeys(item["fact_ids"]))
+		public_answers.append(item)
+	role_instruction = _clean_whitespace(target_role) or "通用"
+	if focus == "sections":
+		focus_instruction = (
+			"本次只生成 sections 和审核信息；projects 必须输出空数组。"
+			"把客户项目名称与职责作为工作经历中的代表项目紧凑合并，不为其单独创建 project。"
+		)
+	elif focus == "projects":
+		focus_instruction = (
+			"本次只生成 projects 和审核信息；sections 必须输出空数组。"
+			"同一 source_filename 的技术总结默认代表同一个仓库项目，即使 STAR title 不同也要归并，"
+			"各 title 作为该项目下的 STAR heading；除非材料明确说明它们是不同项目。"
+			"source_filename 只用于归并，不是默认项目标题。项目标题优先采用事实 structured_data.title "
+			"或材料正文明确写出的项目、案例、作品、活动名称；只有文件名本身明显是可投递的项目名称时，"
+			"才可去掉扩展名和“技术总结”等后缀使用。不得把 README、resume、*_case 等机器式文件名写入简历。"
+		)
+	else:
+		focus_instruction = "本次同时生成 sections 和 projects。"
 	return f"""你是严谨的中文简历编辑。把已接受事实和已确认回答整理成可直接审阅和启用的中文职业简历档案。
+
+目标岗位：{role_instruction}
+生成阶段：{focus_instruction}
 
 规则：
 1. 只能使用输入中的信息，不得新增或推测数字、日期、技术、公司、职责和成果。
-2. 每个输出条目必须引用有效 fact_ids 或 clarification_ids。
+2. 每个输出条目必须引用有效 fact_ids 或 clarification_ids；简历实体 fields 每行依次为 [fact_id, field_name, value]，确认回答 ids 中的值是 clarification_id。
 3. 项目、竞赛或作品必须按 group_id、标题和来源文件归并；一个 project 下可以且应当包含多个 stars，每个 star 表达一个较小的技术贡献。
-4. 每个 star 的 bullet 应优先写成“使用/基于什么技术或方法，解决/完成什么问题或任务；产生什么已证实结果”。没有结果证据时省略结果，不得编造，并把缺口放入 known_gaps。
+4. 每个 star 的 bullet 应优先写成“使用/基于什么工具、技术、方法、流程或专业能力，解决/完成什么问题或任务；产生什么已证实结果”。没有结果证据时省略结果，不得编造，并把缺口放入 known_gaps。
 5. situation、task、action、result 是内部事实结构；最终 bullet 不要机械输出 S/T/A/R 标签。action 和 bullet 必须存在。
 6. 项目标题只出现一次，同一项目的多个技术贡献分别放入 stars；不要把一个项目拆成多个重复项目。
 7. 非项目类基本信息、教育、专业能力可放入 sections。项目、竞赛、作品不得只放在 sections。
 8. 团队方案没有个人贡献证据时，不得使用主导、负责、推动或独立完成等动词。
-9. approved_framings 只收录用户确认回答中明确表达的边界，否则输出空数组。
+9. known_gaps 和 approved_framings 只是审核报告字段，不属于投递简历正文；approved_framings 只收录用户明确确认的表达边界。
 10. 每个项目和 STAR 都必须携带支撑自身文本的引用 ID。
-11. 输出要接近一份简洁中文简历：最多 8 个项目，每个项目选择 1-5 条不重复且最能体现技术能力的 STAR；不要求消耗全部事实，避免逐字段照抄和重复。
+11. 输出要接近一份简洁中文简历：最多 4 个项目，每个项目选择 1-5 条不重复且最能体现目标职业价值的 STAR；优先保留已确认的采用/服务范围、项目覆盖、质量改进、交付成果、客户或用户影响、真实问题闭环和岗位相关能力。简历来源中只有项目名称与职责的经历可以作为代表项目合并进工作经历 section；总结材料/作品集中的 star_story 优先整理为 projects。
 12. sections 中同类原子事实先合并为紧凑条目；项目技术贡献之间要有清楚边界。
-13. 只输出 JSON：
+13. 目标岗位只能影响事实的选择、排序和篇幅，不能作为事实来源，也不能据此新增输入中没有的技术、职责、关键词或成果。
+14. 已确认回答是新增证据：回答补充了本人动作、任务、结果、量化口径或贡献等级时，必须融入对应 section 或 STAR 正文并引用 clarification_ids，不得只放入 approved_framings。回答为“无”、未确认信息或纯表达边界时才不写入正文。\n15. 只输出 JSON：
 {{
   "sections":[{{"key":"skills","title":"专业能力","items":[{{"text":"条目","fact_ids":["id"],"clarification_ids":[]}}]}}],
   "projects":[{{
@@ -942,10 +1241,10 @@ def _profile_prompt(facts: list[dict], clarifications: list[dict]) -> str:
 }}。
 
 已接受事实：
-{json.dumps(public_facts, ensure_ascii=False)}
+{json.dumps(public_facts, ensure_ascii=False, separators=(",", ":"))}
 
 已确认回答：
-{json.dumps(public_answers, ensure_ascii=False)}
+{json.dumps(public_answers, ensure_ascii=False, separators=(",", ":"))}
 """
 
 
@@ -971,6 +1270,7 @@ def _validated_profile_item(
 		evidence_parts.extend([
 			str(fact.get("effective_content", "")),
 			str(fact.get("evidence", "")),
+			str(fact.get("source_filename", "")),
 			json.dumps(fact.get("structured_data"), ensure_ascii=False),
 		])
 	for clarification_id in clarification_ids:
@@ -989,20 +1289,37 @@ def _validated_profile_payload(
 	payload: dict,
 	facts: list[dict],
 	clarifications: list[dict],
-) -> tuple[dict, list[str], list[str]]:
+	*,
+	allow_partial: bool = False,
+	require_projects: bool = True,
+) -> tuple[dict, list[str], list[str], list[str]]:
 	fact_map = {fact["id"]: fact for fact in facts}
 	clarification_map = {
-		item["id"]: item for item in clarifications if item.get("status") == "answered" and item.get("answer")
+		item["id"]: item
+		for item in clarifications
+		if item.get("status") == "answered"
+		and item.get("answer")
+		and (not item.get("fact_id") or str(item["fact_id"]) in fact_map)
 	}
 	used_fact_ids: list[str] = []
 	used_clarification_ids: list[str] = []
+	validation_warnings: list[str] = []
 
-	def validate_items(values: object) -> list[dict]:
+	def validate_item(value: object, context: str) -> dict | None:
+		try:
+			return _validated_profile_item(value, fact_map, clarification_map)
+		except ResumeBuilderError as exc:
+			if not allow_partial:
+				raise
+			validation_warnings.append(f"{context}：{exc}")
+			return None
+
+	def validate_items(values: object, context: str) -> list[dict]:
 		result: list[dict] = []
 		if not isinstance(values, list):
 			return result
-		for value in values:
-			item = _validated_profile_item(value, fact_map, clarification_map)
+		for index, value in enumerate(values, start=1):
+			item = validate_item(value, f"{context}第 {index} 条")
 			if item:
 				result.append(item)
 				used_fact_ids.extend(item["fact_ids"])
@@ -1015,43 +1332,55 @@ def _validated_profile_payload(
 			continue
 		key = re.sub(r"[^a-z0-9_-]", "", str(section.get("key", "")).casefold())[:40]
 		title = _clean_whitespace(str(section.get("title", "")))[:80]
-		items = validate_items(section.get("items"))
+		items = validate_items(section.get("items"), title or "正文")
 		if key and title and items:
 			sections.append({"key": key, "title": title, "items": items})
 
-	def referenced_item(text: object, fact_ids: object, clarification_ids: object) -> dict | None:
-		return _validated_profile_item(
+	def referenced_item(
+		text: object,
+		fact_ids: object,
+		clarification_ids: object,
+		context: str,
+	) -> dict | None:
+		return validate_item(
 			{"text": text, "fact_ids": fact_ids, "clarification_ids": clarification_ids},
-			fact_map,
-			clarification_map,
+			context,
 		)
 
 	projects: list[dict] = []
-	for raw_project in payload.get("projects", []):
+	for project_index, raw_project in enumerate(payload.get("projects", []), start=1):
 		if not isinstance(raw_project, dict):
 			continue
 		project_fact_ids = raw_project.get("fact_ids", [])
 		project_clarification_ids = raw_project.get("clarification_ids", [])
 		title_item = referenced_item(
-			raw_project.get("title"), project_fact_ids, project_clarification_ids
+			raw_project.get("title"), project_fact_ids, project_clarification_ids,
+			f"第 {project_index} 个项目标题",
 		)
 		if not title_item:
 			continue
 		meta_text = _clean_whitespace(str(raw_project.get("meta", "")))
-		meta_item = referenced_item(meta_text, project_fact_ids, project_clarification_ids) if meta_text else None
+		meta_item = referenced_item(
+			meta_text, project_fact_ids, project_clarification_ids,
+			f"项目“{title_item['text']}”元信息",
+		) if meta_text else None
 		stars: list[dict] = []
-		for raw_star in raw_project.get("stars", []):
+		for star_index, raw_star in enumerate(raw_project.get("stars", []), start=1):
 			if not isinstance(raw_star, dict):
 				continue
 			star_fact_ids = raw_star.get("fact_ids", [])
 			star_clarification_ids = raw_star.get("clarification_ids", [])
 			bullet_item = referenced_item(
-				raw_star.get("bullet"), star_fact_ids, star_clarification_ids
+				raw_star.get("bullet"), star_fact_ids, star_clarification_ids,
+				f"项目“{title_item['text']}”第 {star_index} 条 STAR",
 			)
+			if not bullet_item:
+				continue
 			action_item = referenced_item(
-				raw_star.get("action"), star_fact_ids, star_clarification_ids
+				raw_star.get("action"), star_fact_ids, star_clarification_ids,
+				f"项目“{title_item['text']}”第 {star_index} 条 Action",
 			)
-			if not bullet_item or not action_item:
+			if not action_item:
 				continue
 			star: dict = {
 				"bullet": bullet_item["text"],
@@ -1062,12 +1391,18 @@ def _validated_profile_payload(
 			for key in ("heading", "situation", "task", "result"):
 				value = _clean_whitespace(str(raw_star.get(key, "")))
 				if value:
-					validated = referenced_item(value, star_fact_ids, star_clarification_ids)
+					validated = referenced_item(
+						value, star_fact_ids, star_clarification_ids,
+						f"项目“{title_item['text']}”第 {star_index} 条 {key}",
+					)
 					if validated:
 						star[key] = validated["text"]
 			technologies: list[str] = []
 			for technology in raw_star.get("technologies", []):
-				validated = referenced_item(technology, star_fact_ids, star_clarification_ids)
+				validated = referenced_item(
+					technology, star_fact_ids, star_clarification_ids,
+					f"项目“{title_item['text']}”第 {star_index} 条技术",
+				)
 				if validated:
 					technologies.append(validated["text"])
 			star["technologies"] = list(dict.fromkeys(technologies))
@@ -1091,22 +1426,114 @@ def _validated_profile_payload(
 		fact.get("fact_type") == "star_story" or fact.get("entity_type") in {"project", "award"}
 		for fact in facts
 	)
-	if has_project_facts and not projects:
+	if require_projects and has_project_facts and not projects and allow_partial:
+		grouped_stars: dict[tuple[str, str], list[dict]] = {}
+		for fact in facts:
+			data = fact.get("structured_data")
+			if fact.get("fact_type") != "star_story" or not isinstance(data, dict):
+				continue
+			title = _clean_whitespace(str(data.get("title", ""))) or str(fact.get("source_filename", "项目"))
+			key = (str(fact.get("source_id", "")), title.casefold())
+			grouped_stars.setdefault(key, []).append(fact)
+		for grouped in list(grouped_stars.values())[:8]:
+			first_data = grouped[0].get("structured_data") or {}
+			title = _clean_whitespace(str(first_data.get("title", ""))) or str(grouped[0].get("source_filename", "项目"))
+			stars: list[dict] = []
+			for fact in grouped[:5]:
+				data = fact.get("structured_data") or {}
+				action = data.get("action") if isinstance(data.get("action"), dict) else {}
+				result = data.get("result") if isinstance(data.get("result"), dict) else {}
+				technologies = [
+					_clean_whitespace(str(item.get("name", "")))
+					for item in data.get("technologies", []) if isinstance(item, dict) and item.get("name")
+				]
+				fact_id = str(fact["id"])
+				stars.append({
+					"heading": "、".join(technologies[:3]) or "技术实现",
+					"action": _clean_whitespace(str(action.get("text", ""))) or fact["effective_content"],
+					"result": _clean_whitespace(str(result.get("text", ""))),
+					"bullet": fact["effective_content"],
+					"technologies": technologies,
+					"fact_ids": [fact_id],
+					"clarification_ids": [],
+				})
+				used_fact_ids.append(fact_id)
+			projects.append({
+				"title": title,
+				"meta": "",
+				"fact_ids": [str(fact["id"]) for fact in grouped[:5]],
+				"clarification_ids": [],
+				"stars": stars,
+			})
+		if projects:
+			validation_warnings.append("AI 项目条目未通过事实校验，已使用接受的 STAR 事实生成保守版本")
+	if require_projects and has_project_facts and not projects:
 		raise ResumeBuilderError("职业档案必须把项目事实整理为一个项目下的一个或多个 STAR")
 	if not sections and not projects:
 		raise ResumeBuilderError("职业档案没有可追溯的正文条目")
 	profile = {
 		"sections": sections,
 		"projects": projects,
-		"known_gaps": validate_items(payload.get("known_gaps")),
-		"approved_framings": validate_items(payload.get("approved_framings")),
+		"known_gaps": validate_items(payload.get("known_gaps"), "待补充信息"),
+		"approved_framings": validate_items(payload.get("approved_framings"), "已确认表达边界"),
 	}
-	return profile, list(dict.fromkeys(used_fact_ids)), list(dict.fromkeys(used_clarification_ids))
+	return (
+		profile,
+		list(dict.fromkeys(used_fact_ids)),
+		list(dict.fromkeys(used_clarification_ids)),
+		list(dict.fromkeys(validation_warnings)),
+	)
 
 
-def _profile_markdown(profile: dict) -> str:
+def _required_body_clarification_ids(facts: list[dict], clarifications: list[dict]) -> list[str]:
+	fact_ids = {str(fact["id"]) for fact in facts}
+	body_kinds = {"missing_situation", "missing_task", "missing_result", "ownership", "metric_source"}
+	review_only_answers = {"无", "没有", "未知", "不确定", "无法确认", "无法核实", "未统计", "不认可"}
+	review_only_prefixes = ("当前未明确", "未确认", "暂无", "没有统计", "无法核实", "不确定")
+	required: list[str] = []
+	for item in clarifications:
+		answer = _clean_whitespace(str(item.get("answer") or ""))
+		if item.get("status") != "answered" or not answer:
+			continue
+		if str(item.get("kind") or "") not in body_kinds:
+			continue
+		if answer.casefold() in review_only_answers or answer.startswith(review_only_prefixes):
+			continue
+		metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+		linked = [str(item["fact_id"])] if item.get("fact_id") else []
+		linked.extend(str(value) for value in metadata.get("fact_ids", []))
+		if linked and not fact_ids.intersection(linked):
+			continue
+		required.append(str(item["id"]))
+	return list(dict.fromkeys(required))
+
+
+def _body_clarification_ids(profile: dict) -> set[str]:
+	result: set[str] = set()
+	for section in profile.get("sections", []):
+		for item in section.get("items", []):
+			result.update(str(value) for value in item.get("clarification_ids", []))
+	for project in profile.get("projects", []):
+		result.update(str(value) for value in project.get("clarification_ids", []))
+		for star in project.get("stars", []):
+			result.update(str(value) for value in star.get("clarification_ids", []))
+	return result
+
+
+def _ensure_answer_fusion(
+	profile: dict,
+	facts: list[dict],
+	clarifications: list[dict],
+) -> None:
+	required = _required_body_clarification_ids(facts, clarifications)
+	missing = [value for value in required if value not in _body_clarification_ids(profile)]
+	if missing:
+		raise ResumeBuilderError("职业档案未融合已确认回答：" + ", ".join(missing))
+
+
+def render_career_profile_markdown(profile: dict) -> str:
 	lines = ["# 职业简历档案"]
-	for section in profile["sections"]:
+	for section in profile.get("sections", []):
 		lines.extend(["", f"## {section['title']}", ""])
 		lines.extend(f"- {item['text']}" for item in section["items"])
 	projects = profile.get("projects", [])
@@ -1119,14 +1546,6 @@ def _profile_markdown(profile: dict) -> str:
 			for star in project["stars"]:
 				prefix = f"**{star['heading']}**：" if star.get("heading") else ""
 				lines.extend(["", f"- {prefix}{star['bullet']}"])
-	for key, title in (
-		("known_gaps", "待补充信息"),
-		("approved_framings", "已确认表达边界"),
-	):
-		items = profile.get(key, [])
-		if items:
-			lines.extend(["", f"## {title}", ""])
-			lines.extend(f"- {item['text']}" for item in items)
 	return "\n".join(lines).strip() + "\n"
 
 
@@ -1135,6 +1554,7 @@ def compose_career_profile(
 	config: dict,
 	*,
 	output_dir: Path,
+	target_role: str = "",
 	call_text: Callable[..., str | None] | None = None,
 ) -> dict:
 	"""Create a durable Career Profile from accepted facts and confirmed answers."""
@@ -1143,50 +1563,110 @@ def compose_career_profile(
 		raise ResumeBuilderError("请先接受至少一条材料事实")
 	clarifications = refresh_profile_clarifications(conn)
 	caller = call_text or call_anthropic_text
-	base_prompt = _profile_prompt(facts, clarifications)
-	payload = _request_json_payload(
-		caller,
-		base_prompt,
-		config,
-		4000,
-		purpose="resume_profile_compose",
-		empty_message="AI 服务未返回职业档案",
-	)
-	try:
-		profile, used_fact_ids, used_clarification_ids = _validated_profile_payload(
-			payload,
-			facts,
+	target_role = _clean_whitespace(target_role)[:100]
+	prompt_facts = _select_profile_prompt_facts(facts, target_role)
+	part_specs = []
+	resume_facts = [fact for fact in prompt_facts if fact.get("fact_type") == "resume_field"]
+	project_facts = [fact for fact in prompt_facts if fact.get("fact_type") != "resume_field"]
+	if resume_facts:
+		part_specs.append(("sections", resume_facts, False, 2600))
+	if project_facts:
+		project_groups: dict[str, list[dict]] = {}
+		for fact in project_facts:
+			group_key = str(fact.get("source_id") or fact.get("source_filename") or "unknown")
+			project_groups.setdefault(group_key, []).append(fact)
+		for group_facts in project_groups.values():
+			part_specs.append(("projects", group_facts, True, 3200))
+
+	profile = {"sections": [], "projects": [], "known_gaps": [], "approved_framings": []}
+	used_fact_ids: list[str] = []
+	used_clarification_ids: list[str] = []
+	validation_warnings: list[str] = []
+	prompt_char_count = 0
+	for focus, part_facts, require_projects, max_tokens in part_specs:
+		base_prompt = _profile_prompt(
+			part_facts,
 			clarifications,
+			target_role,
+			focus=focus,
 		)
-	except ResumeBuilderError as exc:
-		message = str(exc)
-		if not message.startswith((
-			"职业档案包含无来源事实",
-			"职业档案提升了个人贡献等级",
-		)):
-			raise
-		repair_prompt = (
-			f"{base_prompt}\n\n上一份草稿未通过确定性校验：{message}。"
-			"请重新生成完整 JSON。每个条目的 text 只能使用该条目自身 fact_ids 和 "
-			"clarification_ids 对应输入中已经出现的数字、日期、英文技术名和贡献动词；"
-			"不能借用其他未引用事实中的词。"
-		)
-		repaired_payload = _request_json_payload(
+		prompt_char_count += len(base_prompt)
+		payload = _request_json_payload(
 			caller,
-			repair_prompt,
+			base_prompt,
 			config,
-			4000,
+			max_tokens,
 			purpose="resume_profile_compose",
-			empty_message="AI 服务未返回修复后的职业档案",
+			empty_message="AI 服务未返回职业档案",
 		)
-		profile, used_fact_ids, used_clarification_ids = _validated_profile_payload(
-			repaired_payload,
-			facts,
-			clarifications,
-		)
-	markdown = _profile_markdown(profile)
+		payload["projects" if focus == "sections" else "sections"] = []
+		try:
+			part_profile, part_fact_ids, part_clarification_ids, part_warnings = _validated_profile_payload(
+				payload,
+				part_facts,
+				clarifications,
+				require_projects=require_projects,
+			)
+			_ensure_answer_fusion(part_profile, part_facts, clarifications)
+		except ResumeBuilderError as exc:
+			message = str(exc)
+			if not message.startswith((
+				"职业档案包含无来源事实",
+				"职业档案提升了个人贡献等级",
+				"职业档案未融合已确认回答",
+			)):
+				raise
+			repair_prompt = (
+				f"{base_prompt}\n\n上一份草稿未通过确定性校验：{message}。"
+				"请重新生成完整 JSON。每个条目的 text 只能使用该条目自身 fact_ids 和 "
+				"clarification_ids 对应输入中已经出现的数字、日期、英文技术名和贡献动词；"
+				"不能借用其他未引用事实中的词。"
+			)
+			repaired_payload = _request_json_payload(
+				caller,
+				repair_prompt,
+				config,
+				max_tokens,
+				purpose="resume_profile_compose",
+				empty_message="AI 服务未返回修复后的职业档案",
+			)
+			repaired_payload["projects" if focus == "sections" else "sections"] = []
+			try:
+				part_profile, part_fact_ids, part_clarification_ids, part_warnings = _validated_profile_payload(
+					repaired_payload,
+					part_facts,
+					clarifications,
+					require_projects=require_projects,
+				)
+				_ensure_answer_fusion(part_profile, part_facts, clarifications)
+			except ResumeBuilderError as repair_exc:
+				if not str(repair_exc).startswith((
+					"职业档案包含无来源事实",
+					"职业档案提升了个人贡献等级",
+				)):
+					raise
+				part_profile, part_fact_ids, part_clarification_ids, part_warnings = _validated_profile_payload(
+					repaired_payload,
+					part_facts,
+					clarifications,
+					allow_partial=True,
+					require_projects=require_projects,
+				)
+		for key, values in profile.items():
+			values.extend(part_profile.get(key, []))
+		used_fact_ids.extend(part_fact_ids)
+		used_clarification_ids.extend(part_clarification_ids)
+		validation_warnings.extend(f"{focus}：{warning}" for warning in part_warnings)
+	used_fact_ids = list(dict.fromkeys(used_fact_ids))
+	used_clarification_ids = list(dict.fromkeys(used_clarification_ids))
+	validation_warnings = list(dict.fromkeys(validation_warnings))
+	markdown = render_career_profile_markdown(profile)
 	open_clarifications = [item for item in clarifications if item["status"] == "open"]
 	quality_report = {
+		"target_role": target_role or "通用",
+		"prompt_char_count": prompt_char_count,
+		"prompt_fact_count": len(prompt_facts),
+		"prompt_request_count": len(part_specs),
 		"accepted_fact_count": len(facts),
 		"used_fact_count": len(used_fact_ids),
 		"unused_fact_ids": [fact["id"] for fact in facts if fact["id"] not in used_fact_ids],
@@ -1194,6 +1674,8 @@ def compose_career_profile(
 		"open_clarification_count": len(open_clarifications),
 		"incomplete_fact_count": sum(bool(fact.get("needs_clarification")) for fact in facts),
 		"evidence_coverage": round(len(used_fact_ids) / len(facts), 4),
+		"validation_warning_count": len(validation_warnings),
+		"validation_warnings": validation_warnings,
 	}
 	profile_id = uuid4().hex
 	output_dir.mkdir(parents=True, exist_ok=True)

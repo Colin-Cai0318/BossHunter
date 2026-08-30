@@ -11,6 +11,7 @@ from bosshunter.resume_builder.service import (
 	extract_source_facts,
 	ingest_resume_source,
 	refresh_profile_clarifications,
+	render_career_profile_markdown,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
 	"extract_source_facts",
 	"ingest_resume_source",
 	"refresh_profile_clarifications",
+	"render_career_profile_markdown",
 ]
