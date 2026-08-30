@@ -10,6 +10,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from bosshunter.ai.credentials import AIRequestError, call_anthropic_text, get_ai_api_key
 from bosshunter.cancellation import OperationCancelled, run_cancellable
+from bosshunter.collection.text import clean_job_description
 from bosshunter.db import (
     add_history,
     get_db,
@@ -39,11 +40,17 @@ SCORING_PROMPT = """你是一位严谨的招聘匹配评估员。请只依据简
 ## 候选人简历
 {resume}
 
+## 候选人个人信息
+- 最高学历：{candidate_education}
+- 求职招聘类型：{candidate_recruitment_type}
+
 ## 岗位信息
 - 职位：{title}
 - 公司：{company}
 - 薪资：{salary}
 - 要求：{experience}
+- 学历要求：{education}
+- 招聘类型：{recruitment_type}
 - JD：{jd}
 
 ## 统一评分维度
@@ -89,6 +96,11 @@ COMPONENT_LIMITS = {
     "hard_requirements": 15,
     "tools_industry": 10,
     "practical_fit": 10,
+}
+# 部分模型（实测 minimaxi M3）会把 transferable_evidence 简写为 transferable，
+# 校验前按别名归一，避免有效评分被误判为解析失败（issue #107）。
+FIELD_ALIASES = {
+    "transferable": "transferable_evidence",
 }
 CAP_LIMITS = {
     "technical_required": (55, "硬技术缺口封顶55"),
@@ -158,7 +170,8 @@ def _truncate_prompt_text(text: str, limit: int) -> str:
     return f"{text[:head]}{marker}{text[-(available - head):]}"
 
 
-def _build_scoring_prompt(job: dict, resume: str, *, compact: bool = False) -> str:
+def _build_scoring_prompt(job: dict, resume: str, config: dict | None = None, *, compact: bool = False) -> str:
+    config = config or {}
     resume_limit = 1400 if compact else 3000
     jd_limit = 900 if compact else 2000
     return SCORING_PROMPT.format(
@@ -167,18 +180,28 @@ def _build_scoring_prompt(job: dict, resume: str, *, compact: bool = False) -> s
         company=job["company"],
         salary=job["salary"],
         experience=job["experience"],
-        jd=_truncate_prompt_text(job.get("jd", ""), jd_limit),
+        education=job.get("education", "") or "未识别",
+        recruitment_type={"campus": "校招", "experienced": "社招"}.get(
+            job.get("recruitment_type", ""), "未识别"
+        ),
+        candidate_education=config.get("profile", {}).get("education", "") or "未填写",
+        candidate_recruitment_type={
+            "campus": "校招",
+            "experienced": "社招",
+            "both": "校招/社招均可",
+        }.get(config.get("profile", {}).get("recruitment_type", ""), "未填写"),
+        jd=_truncate_prompt_text(clean_job_description(job.get("jd", "")), jd_limit),
     )
 
 
-def _build_review_prompt(job: dict, resume: str, first: ScoreResult) -> str:
+def _build_review_prompt(job: dict, resume: str, first: ScoreResult, config: dict | None = None) -> str:
     first_result = {
         "components": first.components,
         "caps": list(first.caps),
         "reason": first.summary_reason,
         "missing": first.missing,
     }
-    return _build_scoring_prompt(job, resume) + REVIEW_PROMPT_SUFFIX.format(
+    return _build_scoring_prompt(job, resume, config) + REVIEW_PROMPT_SUFFIX.format(
         first_result=json.dumps(first_result, ensure_ascii=False),
     )
 
@@ -276,14 +299,37 @@ def _structured_score_result(result: dict, *, reviewed: bool = False) -> ScoreRe
     )
 
 
+def _apply_field_aliases(result: dict) -> dict:
+    """Normalize common model-side field shortenings (e.g. minimaxi M3's `transferable`)."""
+    for alias, canonical in FIELD_ALIASES.items():
+        if alias in result and canonical not in result:
+            result[canonical] = result[alias]
+    return result
+
+
 def _validated_score_result(text: str) -> ScoreResult | None:
     """Accept only complete structured evidence scores."""
     result = _parse_score_response(text)
     if not isinstance(result, dict):
         return None
+    _apply_field_aliases(result)
     if all(key in result for key in COMPONENT_LIMITS):
         return _structured_score_result(result)
     return None
+
+
+def _score_validation_failure_reason(text: str | None) -> str:
+    """Explain why a scoring response failed validation, for failure records."""
+    if not text or not str(text).strip():
+        return "AI 未返回评分内容"
+    result = _parse_score_response(text)
+    if not isinstance(result, dict):
+        return "AI 返回内容无法解析为 JSON"
+    _apply_field_aliases(result)
+    missing = [key for key in COMPONENT_LIMITS if key not in result]
+    if missing:
+        return "AI 评分 JSON 缺少字段: " + ", ".join(missing)
+    return "AI 评分 JSON 字段值无效（分数或理由不符合格式要求）"
 
 
 def _merge_review_results(first: ScoreResult, review: ScoreResult) -> ScoreResult:
@@ -346,6 +392,7 @@ def _report_checkpoint(
     *,
     status: str,
     pause_reason: str = "",
+    error: str | None = None,
 ) -> None:
     callback = config.get("_workbench_score_checkpoint")
     if callable(callback):
@@ -353,6 +400,8 @@ def _report_checkpoint(
             "remaining_job_ids": list(remaining_job_ids),
             "status": status,
             "pause_reason": pause_reason,
+            # 只有 AI 失败导致的暂停才带 error；用户手动暂停不应记为错误（issue #100）。
+            "error": error or "",
         })
 
 
@@ -373,7 +422,7 @@ def _request_score(
     ai_cfg = config.get("ai", {}) if isinstance(config.get("ai"), dict) else {}
     response: str | None = None
     try:
-        response = _call_claude(_build_scoring_prompt(job, resume), config)
+        response = _call_claude(_build_scoring_prompt(job, resume, config), config)
     except AIRequestError as exc:
         if exc.kind == "output_truncated":
             _notify(config, f"{job['company']}｜{job['title']} 的评分回答被截断，正在增大输出 Token 上限后重试。")
@@ -383,29 +432,46 @@ def _request_score(
                 configured_tokens = 8192
             retry_tokens = min(max(configured_tokens * 2, 512), 65536)
             try:
-                response = _call_claude(_build_scoring_prompt(job, resume), config, retry_tokens)
+                response = _call_claude(_build_scoring_prompt(job, resume, config), config, retry_tokens)
             except AIRequestError as retry_exc:
-                if retry_exc.kind in {"output_truncated", "output_limit", "context_limit"}:
+                if retry_exc.kind == "empty_response":
+                    # 空响应用保持"空结果"语义：落入下方按配置重试，仍空则岗位级失败（#101 回归）。
+                    response = None
+                elif retry_exc.kind in {"output_truncated", "output_limit", "context_limit"}:
                     return ScoreOutcome(failure_detail="调整输出 Token 后仍未获得完整评分")
-                return ScoreOutcome(pause_reason=retry_exc.user_message)
+                else:
+                    # 带上"因截断进入重试"的上下文，否则只看得到重试时的错误（issue #101）。
+                    return ScoreOutcome(pause_reason=f"增大输出 Token 重试后失败：{retry_exc}")
         elif exc.kind == "output_limit":
             _notify(config, f"{job['company']}｜{job['title']} 正在降低输出 Token 上限后重试评分。")
             try:
-                response = _call_claude(_build_scoring_prompt(job, resume), config, 128)
+                response = _call_claude(_build_scoring_prompt(job, resume, config), config, 128)
             except AIRequestError as retry_exc:
-                if retry_exc.kind == "output_limit":
+                if retry_exc.kind == "empty_response":
+                    response = None
+                elif retry_exc.kind == "output_limit":
                     return ScoreOutcome(failure_detail="当前模型不接受调整后的输出 Token 设置")
-                return ScoreOutcome(pause_reason=retry_exc.user_message)
+                else:
+                    return ScoreOutcome(pause_reason=f"降低输出 Token 重试后失败：{retry_exc}")
         elif exc.kind == "context_limit":
             _notify(config, f"{job['company']}｜{job['title']} 内容较长，正在压缩后重试评分。")
             try:
-                response = _call_claude(_build_scoring_prompt(job, resume, compact=True), config, 128)
+                response = _call_claude(_build_scoring_prompt(job, resume, config, compact=True), config, 128)
             except AIRequestError as retry_exc:
-                if retry_exc.kind == "context_limit":
+                if retry_exc.kind == "empty_response":
+                    response = None
+                elif retry_exc.kind == "context_limit":
                     return ScoreOutcome(failure_detail="压缩请求后仍超过模型上下文限制")
-                return ScoreOutcome(pause_reason=retry_exc.user_message)
+                else:
+                    return ScoreOutcome(pause_reason=f"压缩请求重试后失败：{retry_exc}")
+        elif exc.kind == "empty_response":
+            # 空响应用保持"空结果"语义：按 max_attempts 走下方重试，仍为空则只记当前岗位失败，
+            # 不中断整批（#101 回归：整批暂停仅留给鉴权/额度/限流/网络等服务级故障）。
+            _notify(config, f"{job['company']}｜{job['title']} 的 AI 回答没有文本内容，正在重试。")
+            response = None
         else:
-            return ScoreOutcome(pause_reason=exc.user_message)
+            # str(exc) 现在带 kind/status_code，UI 才能区分限流/鉴权/额度等失败原因（issue #101）。
+            return ScoreOutcome(pause_reason=str(exc))
 
     result = _validated_score_result(response) if response else None
     for attempt in range(2, max_attempts + 1):
@@ -416,15 +482,15 @@ def _request_score(
             f"{job['company']}｜{job['title']} 未返回完整评分，正在重试（{attempt}/{max_attempts}）。",
         )
         try:
-            response = _call_claude(_build_scoring_prompt(job, resume), config)
+            response = _call_claude(_build_scoring_prompt(job, resume, config), config)
         except AIRequestError as retry_exc:
             if retry_exc.kind in {"token_quota", "rate_limit", "auth", "network", "request_failed"}:
-                return ScoreOutcome(pause_reason=retry_exc.user_message)
+                return ScoreOutcome(pause_reason=str(retry_exc))
             response = None
         result = _validated_score_result(response) if response else None
 
     if result is None:
-        return ScoreOutcome(failure_detail="AI 未返回完整、可解析的评分 JSON")
+        return ScoreOutcome(failure_detail=_score_validation_failure_reason(response))
     return ScoreOutcome(result=result)
 
 
@@ -446,10 +512,10 @@ def _score_job_with_ai(
         return outcome
 
     try:
-        response = _call_claude(_build_review_prompt(job, resume, first), config)
+        response = _call_claude(_build_review_prompt(job, resume, first, config), config)
     except AIRequestError as exc:
         if exc.kind in {"token_quota", "rate_limit", "auth", "network", "request_failed"}:
-            return ScoreOutcome(result=first, pause_reason=exc.user_message)
+            return ScoreOutcome(result=first, pause_reason=str(exc))
         _notify(config, f"{job['company']}｜{job['title']} 二次复核未完成，保留第一次评分。")
         return outcome
 
@@ -641,6 +707,8 @@ def score_jobs(
                 remaining_job_ids,
                 status="paused",
                 pause_reason=pause_reason or "用户暂停或任务中断",
+                # pause_reason 非空即 AI 失败暂停（用户停止走 stop_event，reason 为空）。
+                error=pause_reason or None,
             )
         else:
             _report_checkpoint(

@@ -15,16 +15,57 @@ from bosshunter.cancellation import (
 )
 from bosshunter.db import (
     get_db, get_jobs_by_status,
-    update_job_status, add_history, add_risk_event,
+    update_job_status, add_history, add_risk_event, set_platform_safety_lock,
 )
 from bosshunter.throttle import RequestThrottle, SendWindowChecker
+from bosshunter.platform_safety import (
+    PlatformAccessGuard,
+    PlatformSafetyStop,
+    TransientPlatformAccessGuard,
+)
 
 console = Console()
 
 PORTFOLIO_URL = None  # Set via config: profile.portfolio_url
 
+
+def get_boss_operation_interval_multiplier(config: dict) -> float:
+    """Return the bounded BOSS page-operation interval multiplier."""
+    raw_value = config.get("collection", {}).get("collection_delay_multiplier", 1.5)
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        value = 1.5
+    return min(max(value, 1.0), 5.0)
+
+
+def _positive_interval_seconds(value: object, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(parsed, 1.0)
+
+
+def get_effective_monitor_interval_minutes(
+    config: dict,
+    base_interval_minutes: float | int | None = None,
+) -> float:
+    """Apply the BOSS operation multiplier to the wait between monitor cycles."""
+    raw_interval = (
+        base_interval_minutes
+        if base_interval_minutes is not None
+        else config.get("monitor", {}).get("interval", 30)
+    )
+    try:
+        interval = float(raw_interval)
+    except (TypeError, ValueError):
+        interval = 30.0
+    return max(interval, 1.0) * get_boss_operation_interval_multiplier(config)
+
+
 # JS: Extract chat list with full message context
-JS_EXTRACT_CHAT_LIST = """
+JS_EXTRACT_CHAT_LIST = r"""
 (() => {
     const items = document.querySelectorAll('li[role=listitem]');
     const results = [];
@@ -41,19 +82,28 @@ JS_EXTRACT_CHAT_LIST = """
         const company = spans.length >= 2 ? spans[1].textContent.trim() : '';
         const hrTitle = spans.length >= 3 ? spans[spans.length - 1].textContent.trim() : '';
 
-        // Determine if HR replied: no message-status means the last message is FROM HR
+        // A missing delivery marker is not enough to prove the message came from HR.
+        // Treat uncertain rows as candidates and verify direction from the full chat.
         const statusClass = msgStatus ? msgStatus.className : '';
-        const isOurMessage = statusClass.includes('status-read') || statusClass.includes('status-delivery');
-        const hasReply = !!lastMsgEl && !isOurMessage;
+        const lastMsgClass = lastMsgEl ? String(lastMsgEl.className || '').toLowerCase() : '';
+        const lastMessage = lastMsgEl ? lastMsgEl.textContent.trim().substring(0, 200) : '';
+        const isOurMessage = statusClass.includes('status-read')
+            || statusClass.includes('status-delivery')
+            || /(myself|self|mine|outgoing|send)/.test(lastMsgClass);
+        const isHrMessage = /(friend|other|incoming|receive)/.test(lastMsgClass);
+        const isSystemMessage = /正在与Boss.+沟通|近30天过滤了.+BOSS发来的消息|你与该职位竞争者PK情况|新岗位速递|VIP数据总结|根据你的历史开聊\/收藏岗位|根据你的开聊\/收藏岗位.+为你推荐\d+个新岗位|识别到以下新发布岗位你可能感兴趣|我是你的求职助手|感谢您使用VIP权益|(?:您的|VIP)权益已到期|点击续费vip|牛人vip怎么样|附件简历请求已发送|附件简历已发送给对方|附件简历.{0,80}已发送给Boss/i.test(lastMessage);
+        const lastDirection = isOurMessage ? 'me' : (isHrMessage ? 'hr' : 'unknown');
+        const hasReply = !!lastMsgEl && lastDirection !== 'me' && !isSystemMessage;
 
         results.push({
             hr_name: nameText.textContent.trim(),
             company: company,
             hr_title: hrTitle,
-            last_message: lastMsgEl ? lastMsgEl.textContent.trim().substring(0, 200) : '',
+            last_message: lastMessage,
             has_reply: hasReply,
             has_unread: !!unreadEl,
             is_our_message: isOurMessage,
+            last_direction: lastDirection,
             element_index: results.length
         });
     });
@@ -97,6 +147,7 @@ class MonitorSafetyGuard:
     """Track consecutive monitor page failures and stop at a conservative threshold."""
 
     def __init__(self, config: dict) -> None:
+        self.config = config
         raw_limit = config.get("monitor", {}).get("max_consecutive_page_failures", 3)
         try:
             self.limit = max(int(raw_limit), 1)
@@ -107,7 +158,7 @@ class MonitorSafetyGuard:
     def record_page_failure(self) -> None:
         self.consecutive_page_failures += 1
         if self.consecutive_page_failures >= self.limit:
-            _raise_monitor_risk("consecutive_page_failures")
+            _raise_monitor_risk("consecutive_page_failures", self.config)
 
     def record_page_success(self) -> None:
         self.consecutive_page_failures = 0
@@ -178,15 +229,30 @@ JS_EXTRACT_CONVERSATION = r"""
         return hasAttachmentResume && hasIntent;
     }
 
+    function senderOf(msg, text) {
+        if (/正在与Boss.+沟通|近30天过滤了.+BOSS发来的消息|你与该职位竞争者PK情况|新岗位速递|VIP数据总结|根据你的历史开聊\/收藏岗位|根据你的开聊\/收藏岗位.+为你推荐\d+个新岗位|识别到以下新发布岗位你可能感兴趣|我是你的求职助手|感谢您使用VIP权益|(?:您的|VIP)权益已到期|点击续费vip|牛人vip怎么样|附件简历请求已发送|附件简历已发送给对方|附件简历.{0,80}已发送给Boss/i.test(text)) {
+            return 'system';
+        }
+
+        const classNames = [msg, ...msg.querySelectorAll('[class]')]
+            .map(el => String(el.className || '').toLowerCase())
+            .join(' ');
+        if (/(^|\s|[-_])(item-myself|message-self|msg-self|is-self|my-message|message-mine|from-me|outgoing)(\s|$|[-_])/.test(classNames)) {
+            return 'me';
+        }
+        if (/(^|\s|[-_])(item-friend|message-other|message-receive|from-other|incoming)(\s|$|[-_])/.test(classNames)) {
+            return 'hr';
+        }
+        return 'unknown';
+    }
+
     const msgs = document.querySelectorAll(MESSAGE_SELECTORS);
     const results = [];
     msgs.forEach(msg => {
-        const isMe = msg.classList.contains('is-self') || msg.classList.contains('message-self')
-            || msg.querySelector('.msg-self') !== null;
         const text = collectVisibleText(msg);
         if (text) {
             results.push({
-                sender: isMe ? 'me' : 'hr',
+                sender: senderOf(msg, text),
                 text: text.substring(0, 500),
                 kind: isResumeRequestCard(text) ? 'resume_request_card' : 'message'
             });
@@ -281,7 +347,7 @@ def _record_page_failure_unless_stopped(config: dict) -> None:
         _monitor_safety_guard(config).record_page_failure()
 
 
-def _record_monitor_risk(kind: str) -> None:
+def _record_monitor_risk(kind: str, config: dict | None = None) -> None:
     """Persist a safe risk event without page text, URLs, or account data."""
     labels = {
         "captcha": "监测检测到验证码，已停止",
@@ -293,6 +359,12 @@ def _record_monitor_risk(kind: str) -> None:
     try:
         db = get_db()
         add_risk_event(db, f"monitor_{kind}", labels.get(kind, "监测检测到风险信号，已停止"))
+        raw_minutes = (config or {}).get("safety", {}).get("risk_lock_minutes", 10)
+        try:
+            lock_minutes = max(int(raw_minutes), 1)
+        except (TypeError, ValueError):
+            lock_minutes = 10
+        set_platform_safety_lock(db, kind, minutes=lock_minutes)
     except Exception:
         # Failure to persist telemetry must never allow risky browsing to continue.
         pass
@@ -301,12 +373,12 @@ def _record_monitor_risk(kind: str) -> None:
             db.close()
 
 
-def _raise_monitor_risk(kind: str) -> None:
-    _record_monitor_risk(kind)
+def _raise_monitor_risk(kind: str, config: dict | None = None) -> None:
+    _record_monitor_risk(kind, config)
     raise MonitorRiskDetected(kind)
 
 
-def _inspect_monitor_page(target_id: str) -> None:
+def _inspect_monitor_page(target_id: str, config: dict) -> None:
     """Stop immediately when the current platform page exposes a risk signal."""
     raw = evaluate(target_id, JS_DETECT_MONITOR_RISK)
     try:
@@ -317,7 +389,7 @@ def _inspect_monitor_page(target_id: str) -> None:
         return
     kind = result.get("risk")
     if kind in {"captcha", "rate_limit", "blocked"}:
-        _raise_monitor_risk(kind)
+        _raise_monitor_risk(kind, config)
 
 
 def _open_monitor_tab(url: str, config: dict) -> str | None:
@@ -329,11 +401,55 @@ def _open_monitor_tab(url: str, config: dict) -> str | None:
     if throttle is not None and bool(getattr(throttle, "has_marked_request", False)):
         if throttle.wait(stop_event):
             return None
+    access_guard = config.get("_platform_access_guard")
+    if isinstance(access_guard, (PlatformAccessGuard, TransientPlatformAccessGuard)):
+        try:
+            access_guard.reserve("monitor_page")
+        except PlatformSafetyStop as exc:
+            raise MonitorRiskDetected(exc.reason) from exc
     target_id = new_tab(url, background=True)
     if throttle is not None and hasattr(throttle, "mark"):
         # Record attempts as well as successful opens so retries cannot become a burst.
         throttle.mark()
     return target_id
+
+
+def _get_monitor_chat_target(chat_url: str, config: dict) -> tuple[str | None, bool]:
+    """Return a live chat-list tab, reusing it for Web monitor loops when enabled."""
+    if not config.get("_monitor_reuse_chat_tab"):
+        return _open_monitor_tab(chat_url, config), False
+
+    runtime_state = config.setdefault("_monitor_runtime_state", {})
+    target_id = runtime_state.get("chat_target_id")
+    if target_id:
+        try:
+            if get_page_info(str(target_id)):
+                return str(target_id), True
+        except Exception:
+            pass
+        runtime_state.pop("chat_target_id", None)
+
+    target_id = _open_monitor_tab(chat_url, config)
+    if target_id:
+        runtime_state["chat_target_id"] = target_id
+    return target_id, False
+
+
+def close_monitor_chat_target(config: dict) -> None:
+    """Close and forget the reusable chat-list tab, if one exists."""
+    runtime_state = config.get("_monitor_runtime_state")
+    if not isinstance(runtime_state, dict):
+        return
+    target_id = runtime_state.pop("chat_target_id", None)
+    if target_id:
+        close_tab(str(target_id))
+
+
+def _discard_monitor_chat_target(config: dict, target_id: str) -> None:
+    runtime_state = config.get("_monitor_runtime_state")
+    if isinstance(runtime_state, dict) and runtime_state.get("chat_target_id") == target_id:
+        runtime_state.pop("chat_target_id", None)
+    close_tab(target_id)
 
 
 def _detect_rejection(messages: list[dict]) -> bool:
@@ -438,6 +554,79 @@ def _get_hr_messages_after_last_reply(messages: list[dict]) -> list[dict]:
     # Get HR messages after that point
     after = messages[last_my_idx + 1:] if last_my_idx >= 0 else messages
     return [m for m in after if m["sender"] == "hr"]
+
+
+def _normalized_message_text(text: str) -> str:
+    """Normalize chat text for conservative sender reconciliation."""
+    return " ".join(str(text or "").split())
+
+
+def _looks_like_system_message(text: str) -> bool:
+    """Identify BOSS UI notices that are not participant messages."""
+    normalized = _normalized_message_text(text)
+    normalized_lower = normalized.lower()
+    system_markers = (
+        "您正在与Boss",
+        "近30天过滤了",
+        "你与该职位竞争者PK情况",
+        "新岗位速递",
+        "VIP数据总结",
+        "根据你的历史开聊/收藏岗位",
+        "识别到以下新发布岗位你可能感兴趣",
+    )
+    assistant_markers = (
+        "我是你的求职助手",
+        "感谢您使用vip权益",
+        "您的权益已到期",
+        "vip权益已到期",
+        "点击续费vip",
+        "牛人vip怎么样",
+        "附件简历请求已发送",
+        "附件简历已发送给对方",
+    )
+    return (
+        any(marker in normalized for marker in system_markers)
+        or any(marker in normalized_lower for marker in assistant_markers)
+        or ("附件简历" in normalized and "已发送给Boss" in normalized)
+    )
+
+
+def _matches_own_greeting(message_text: str, greeting: str) -> bool:
+    """Return true when a chat bubble contains this job's saved greeting."""
+    message = _normalized_message_text(message_text)
+    expected = _normalized_message_text(greeting)
+    if len(expected) < 8 or not message:
+        return False
+    if expected in message:
+        return True
+    prefix_length = min(len(expected), 48)
+    return prefix_length >= 24 and expected[:prefix_length] in message
+
+
+def _reconcile_conversation_messages(messages: list[dict], job: dict) -> list[dict]:
+    """Correct known own/system messages without guessing unknown as HR."""
+    greeting = str(job.get("greeting") or "")
+    reconciled = []
+    for raw_message in messages:
+        message = dict(raw_message) if isinstance(raw_message, dict) else {}
+        text = str(message.get("text") or "")
+        sender = str(message.get("sender") or "unknown")
+        strong_resume_request = (
+            message.get("kind") == "resume_request_card"
+            or _looks_like_resume_request_card(text)
+        )
+        if _looks_like_system_message(text) and not strong_resume_request:
+            sender = "system"
+        elif _matches_own_greeting(text, greeting):
+            sender = "me"
+        elif strong_resume_request and sender in {"unknown", "system"}:
+            sender = "hr"
+        elif sender not in {"me", "hr", "system"}:
+            sender = "unknown"
+        message["sender"] = sender
+        message["text"] = text
+        reconciled.append(message)
+    return reconciled
 
 
 def _truncate_text(text: str, limit: int) -> str:
@@ -660,7 +849,7 @@ def _open_conversation(job: dict, config: dict) -> str | None:
                 _record_page_failure_unless_stopped(config)
                 return None
             try:
-                _inspect_monitor_page(target_id)
+                _inspect_monitor_page(target_id, config)
             except MonitorRiskDetected:
                 close_tab(target_id)
                 raise
@@ -675,7 +864,7 @@ def _open_conversation(job: dict, config: dict) -> str | None:
                     _record_page_failure_unless_stopped(config)
                     return None
                 try:
-                    _inspect_monitor_page(target_id)
+                    _inspect_monitor_page(target_id, config)
                 except MonitorRiskDetected:
                     close_tab(target_id)
                     raise
@@ -717,7 +906,7 @@ def _open_conversation_from_chat_list(job: dict, config: dict) -> str | None:
         _record_page_failure_unless_stopped(config)
         return None
     try:
-        _inspect_monitor_page(target_id)
+        _inspect_monitor_page(target_id, config)
     except MonitorRiskDetected:
         close_tab(target_id)
         raise
@@ -798,7 +987,7 @@ def _open_conversation_from_chat_list(job: dict, config: dict) -> str | None:
                 close_tab(target_id)
                 return None
             try:
-                _inspect_monitor_page(target_id)
+                _inspect_monitor_page(target_id, config)
             except MonitorRiskDetected:
                 close_tab(target_id)
                 raise
@@ -827,7 +1016,7 @@ def _open_conversation_from_chat_list(job: dict, config: dict) -> str | None:
                     close_tab(target_id)
                     return None
                 try:
-                    _inspect_monitor_page(target_id)
+                    _inspect_monitor_page(target_id, config)
                 except MonitorRiskDetected:
                     close_tab(target_id)
                     raise
@@ -892,7 +1081,7 @@ def _deliver_resume_to_chat(target_id: str) -> bool:
     return True  # Optimistic - resume dialog appeared and we clicked send
 
 
-def check_replies(config: dict) -> list[dict]:
+def _check_boss_replies(config: dict, tracked_jobs: list[dict] | None = None) -> list[dict]:
     """Open BOSS chat page and detect conversations with HR replies.
 
     Returns list of conversations with replies (including matched job info).
@@ -905,12 +1094,17 @@ def check_replies(config: dict) -> list[dict]:
     chat_url = monitor_cfg.get("chat_url", "https://www.zhipin.com/web/geek/chat")
 
     # Get jobs we've sent greetings to (or already replied/resume_sent/follow_up_sent/needs_resume - keep monitoring)
-    sent_jobs = get_jobs_by_status(db, "sent")
-    replied_jobs = get_jobs_by_status(db, "replied")
-    resume_sent_jobs = get_jobs_by_status(db, "resume_sent")
-    follow_up_jobs = get_jobs_by_status(db, "follow_up_sent")
-    needs_resume_jobs = get_jobs_by_status(db, "needs_resume")
-    all_tracked_jobs = sent_jobs + replied_jobs + resume_sent_jobs + follow_up_jobs + needs_resume_jobs
+    if tracked_jobs is None:
+        sent_jobs = get_jobs_by_status(db, "sent")
+        replied_jobs = get_jobs_by_status(db, "replied")
+        resume_sent_jobs = get_jobs_by_status(db, "resume_sent")
+        follow_up_jobs = get_jobs_by_status(db, "follow_up_sent")
+        needs_resume_jobs = get_jobs_by_status(db, "needs_resume")
+        tracked_jobs = sent_jobs + replied_jobs + resume_sent_jobs + follow_up_jobs + needs_resume_jobs
+    all_tracked_jobs = [
+        job for job in tracked_jobs
+        if str(job.get("source_platform") or "boss").strip().lower() == "boss"
+    ]
 
     if not all_tracked_jobs:
         console.print("[dim]没有需要监测的对话[/dim]")
@@ -920,39 +1114,45 @@ def check_replies(config: dict) -> list[dict]:
     console.print(f"[bold]监测 {len(all_tracked_jobs)} 个对话的回复情况...[/bold]")
 
     # Open chat page
-    target_id = _open_monitor_tab(chat_url, config)
+    target_id, reused_chat_target = _get_monitor_chat_target(chat_url, config)
     if not target_id:
         console.print("[red]无法打开聊天页面[/red]")
         db.close()
         _monitor_safety_guard(config).record_page_failure()
         return []
 
-    if _wait_or_stop(config, 3) or not _wait_for_page_or_stop(target_id, config, timeout=10):
-        close_tab(target_id)
+    if (
+        (not reused_chat_target and _wait_or_stop(config, 3))
+        or not _wait_for_page_or_stop(target_id, config, timeout=10)
+    ):
+        _discard_monitor_chat_target(config, target_id)
         db.close()
         if not stop_requested(config):
             _monitor_safety_guard(config).record_page_failure()
         return []
     try:
-        _inspect_monitor_page(target_id)
+        _inspect_monitor_page(target_id, config)
     except MonitorRiskDetected:
-        close_tab(target_id)
+        _discard_monitor_chat_target(config, target_id)
         db.close()
         raise
-    if _wait_or_stop(config, 2):
-        close_tab(target_id)
+    if not reused_chat_target and _wait_or_stop(config, 2):
+        _discard_monitor_chat_target(config, target_id)
         db.close()
         return []
 
     # Extract chat list
     raw = evaluate(target_id, JS_EXTRACT_CHAT_LIST)
-    close_tab(target_id)
+    if not config.get("_monitor_reuse_chat_tab"):
+        close_tab(target_id)
     if stop_requested(config):
         db.close()
         return []
 
     if not raw:
         console.print("[yellow]未能获取聊天列表[/yellow]")
+        if config.get("_monitor_reuse_chat_tab"):
+            _discard_monitor_chat_target(config, target_id)
         db.close()
         _monitor_safety_guard(config).record_page_failure()
         return []
@@ -961,12 +1161,16 @@ def check_replies(config: dict) -> list[dict]:
         conversations = json.loads(raw) if isinstance(raw, str) else raw
     except (json.JSONDecodeError, TypeError):
         console.print("[yellow]聊天列表解析失败[/yellow]")
+        if config.get("_monitor_reuse_chat_tab"):
+            _discard_monitor_chat_target(config, target_id)
         db.close()
         _monitor_safety_guard(config).record_page_failure()
         return []
 
     if not isinstance(conversations, list):
         console.print("[yellow]聊天列表格式异常[/yellow]")
+        if config.get("_monitor_reuse_chat_tab"):
+            _discard_monitor_chat_target(config, target_id)
         db.close()
         _monitor_safety_guard(config).record_page_failure()
         return []
@@ -1011,7 +1215,12 @@ def check_replies(config: dict) -> list[dict]:
             # Update status to replied if it was 'sent'
             if matched_job.get("status") == "sent":
                 update_job_status(db, matched_job["id"], "replied")
-                add_history(db, matched_job["id"], "replied", f"HR回复: {conv.get('last_message', '')[:50]}")
+                add_history(
+                    db,
+                    matched_job["id"],
+                    "hr_reply_detected",
+                    f"HR回复: {conv.get('last_message', '')[:50]}",
+                )
 
             results.append({
                 "job": matched_job,
@@ -1029,6 +1238,19 @@ def check_replies(config: dict) -> list[dict]:
 
     db.close()
     return results
+
+
+def check_replies(config: dict) -> list[dict]:
+    """Check BOSS replies; collection-only platforms never enter chat flows."""
+    db = get_db()
+    try:
+        tracked = []
+        for status in ("sent", "replied", "resume_sent", "follow_up_sent", "needs_resume"):
+            tracked.extend(get_jobs_by_status(db, status))
+    finally:
+        db.close()
+    boss_results = _check_boss_replies(config, tracked)
+    return boss_results
 
 
 def _match_conversation_to_job(conv: dict, jobs: list[dict]) -> dict | None:
@@ -1092,7 +1314,7 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
         close_tab(target_id)
         return "stopped"
 
-    # Extract full conversation messages
+    # Extract full BOSS conversation messages.
     raw = evaluate(target_id, JS_EXTRACT_CONVERSATION)
     if stop_requested(config):
         close_tab(target_id)
@@ -1109,6 +1331,10 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
         close_tab(target_id)
         _monitor_safety_guard(config).record_page_failure()
         return "failed"
+    if not isinstance(messages, list):
+        close_tab(target_id)
+        return "failed"
+    messages = _reconcile_conversation_messages(messages, job)
 
     if not isinstance(messages, list):
         close_tab(target_id)
@@ -1130,6 +1356,14 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
         console.print("[dim]    相同HR消息已有待确认回复，跳过重复处理[/dim]")
         close_tab(target_id)
         return "skipped_existing_pending"
+
+    db = get_db()
+    already_handled_reply = _has_handled_reply_for_messages(db, job["id"], messages)
+    db.close()
+    if already_handled_reply:
+        console.print("[dim]    相同HR消息已处理过，跳过重复回复[/dim]")
+        close_tab(target_id)
+        return "skipped_handled_reply"
 
     # Check if HR is rejecting
     if _detect_rejection(messages):
@@ -1287,7 +1521,12 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
     if _send_message_in_chat(target_id, reply):
         console.print("[green]    ✓ 自动回复已发送[/green]")
         db = get_db()
-        add_history(db, job["id"], "auto_replied", _build_reply_detail(messages, reply))
+        add_history(
+            db,
+            job["id"],
+            "auto_replied",
+            _build_reply_detail(messages, reply, "auto_replied.v1", conversation=conversation),
+        )
         db.close()
         close_tab(target_id)
         return "auto_replied"
@@ -1343,6 +1582,19 @@ def _get_latest_handled_reply(db, job_id: str):
         """,
         (job_id,),
     ).fetchone()
+
+
+def _has_handled_reply_for_messages(db, job_id: str, messages: list[dict]) -> bool:
+    """Keep one outbound decision per HR turn while allowing later HR turns."""
+    handled = _get_latest_handled_reply(db, job_id)
+    if handled is None:
+        return False
+    if _row_text(handled, "action") not in {"replied", "auto_replied"}:
+        return False
+    handled_fingerprint = _reply_fingerprint_from_detail(_row_text(handled, "detail"))
+    if not handled_fingerprint:
+        return False
+    return handled_fingerprint == _reply_fingerprint_from_messages(messages)
 
 
 def _pending_matches_chat_list(pending_detail: str, conversation: dict) -> bool:
@@ -1576,13 +1828,19 @@ def monitor_and_send_resumes(config: dict) -> dict:
         console.print("[yellow]当前不在工作时间窗口内 (09:00-16:00)[/yellow]")
         return {"skipped": 0, "replied": 0, "needs_resume": 0, "rejected": 0, "failed": 0}
 
+    operation_multiplier = get_boss_operation_interval_multiplier(config)
     throttle = RequestThrottle(
-        throttle_config.get("interval_min", 60),
-        throttle_config.get("interval_max", 180),
+        _positive_interval_seconds(throttle_config.get("interval_min"), 60) * operation_multiplier,
+        _positive_interval_seconds(throttle_config.get("interval_max"), 180) * operation_multiplier,
     )
     monitor_config = dict(config)
     monitor_config["_monitor_request_throttle"] = throttle
     monitor_config["_monitor_safety_guard"] = MonitorSafetyGuard(config)
+    monitor_config["_platform_access_guard"] = TransientPlatformAccessGuard(
+        config,
+        "monitor",
+        get_db,
+    )
 
     summary = {"skipped": 0, "replied": 0, "needs_resume": 0, "rejected": 0, "failed": 0}
 
@@ -1622,6 +1880,7 @@ def monitor_and_send_resumes(config: dict) -> dict:
                 "skipped_user_replied",
                 "skipped_existing_resume",
                 "skipped_existing_pending",
+                "skipped_handled_reply",
                 "skipped_dismissed_reply",
             ):
                 summary["skipped"] += 1
