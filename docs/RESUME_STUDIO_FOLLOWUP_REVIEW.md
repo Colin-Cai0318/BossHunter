@@ -235,3 +235,18 @@
 - 回归明确禁止在用户问题中出现 position、group_id 等内部字段。
 - Resume Studio 定向测试：38 passed，4 subtests passed。
 - 前端 TypeScript/Vite 生产构建、Ruff 和 Skill 校验通过。
+## 上游同步与最终组合验证（2026-08-31）
+
+- 上游基线：powerycy/BossHunter main 的 aa337e6。
+- 独立同步 PR：https://github.com/Colin-Cai0318/BossHunter/pull/2。
+- fork/main 合并提交：916362f。
+- 同步冲突处理：
+  - README 采用上游精简结构，同时保留简历工作室能力与文档入口；
+  - 数据库同时初始化 Resume Studio 与 collection runs；
+  - resume_upload 保留共享文档转换模块，其 Markdown UTF-8 校验覆盖上游修复；
+  - 前端从合并后的 TypeScript 源码重新构建，不保留任一侧旧资源哈希。
+- 上游同步分支验证：547 passed，19 subtests passed。
+- 最终功能组合分支验证：555 passed，23 subtests passed。
+- 最终前端 TypeScript/Vite 生产构建通过。
+- 唯一告警为工作区 .pytest_cache 无写权限，不影响测试结果。
+- resume_markdown/ 和 start-bosshunter.cmd 始终保持未跟踪，未进入提交或 PR。
