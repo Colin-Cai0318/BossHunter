@@ -7,7 +7,7 @@ from socketserver import ThreadingMixIn
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from wsgiref.simple_server import WSGIServer
 from zipfile import ZipFile
 
@@ -27,6 +27,7 @@ from bosshunter.throttle import SendWindowChecker
 from bosshunter.web import server
 from threading import Event, Lock
 
+from bosshunter.scoring_run_store import create_scoring_run, get_scoring_run, update_scoring_run
 from bosshunter.web.tasks import TaskAlreadyRunningError, WorkbenchTask, WorkbenchTaskRunner
 
 
@@ -416,6 +417,33 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(payload["total"], 3)
         self.assertEqual([job["id"] for job in payload["items"]], ["middle", "low"])
 
+    def test_job_search_supports_whitelisted_column_sorting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                for job_id, score, education in (("low", 60, "本科"), ("high", 90, "博士")):
+                    job = _job(job_id)
+                    job["education"] = education
+                    insert_job(db, job)
+                    update_job_score(db, job_id, score, "评分")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/jobs/search?sort_by=score&sort_order=asc")
+            invalid_sort_status, _, invalid_sort_body = self._request(
+                "/api/jobs/search?sort_by=score%20DESC&sort_order=asc"
+            )
+            invalid_order_status, _, invalid_order_body = self._request(
+                "/api/jobs/search?sort_by=score&sort_order=sideways"
+            )
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual([job["id"] for job in json.loads(body)["items"]], ["low", "high"])
+        self.assertTrue(invalid_sort_status.startswith("400"), invalid_sort_body)
+        self.assertTrue(invalid_order_status.startswith("400"), invalid_order_body)
+
     def test_job_search_decodes_chinese_keyword_as_utf8(self):
         with tempfile.TemporaryDirectory() as tmp:
             base_dir = Path(tmp)
@@ -553,6 +581,48 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertIn("application/json", headers["Content-Type"])
         self.assertEqual([job["id"] for job in payload["pending_confirmation"]], ["ready-job"])
 
+    def test_workbench_excludes_collection_only_platforms_from_automatic_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                external = _job("zhilian-ready")
+                external.update({"source_platform": "zhilian", "source_job_id": "zhilian-ready"})
+                insert_job(db, external)
+                update_job_score(db, "zhilian-ready", 90, "匹配")
+                update_job_status(db, "zhilian-ready", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/workbench")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["pending_confirmation"], [])
+
+    def test_web_api_workbench_reports_daily_send_quota(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("sent-today"))
+                add_history(db, "sent-today", "sent", "已发送")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/workbench")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["send_quota"], {
+            "daily_limit": 30,
+            "sent": 1,
+            "remaining": 29,
+            "exhausted": False,
+        })
+
     def test_web_api_workbench_shows_approved_job_when_greeting_was_interrupted(self):
         with tempfile.TemporaryDirectory() as tmp:
             base_dir = Path(tmp)
@@ -579,7 +649,9 @@ class WebApiRouteTests(unittest.TestCase):
             base_dir = Path(tmp)
             db = get_db(base_dir / "data" / "bosshunter.db")
             try:
-                now = datetime.now(UTC).replace(tzinfo=None)
+                # Funnel "today" uses the machine's local calendar day. Keep fixtures
+                # in the same clock so this remains stable around local midnight.
+                now = datetime.now()
                 fixtures = (
                     ("today-ready", "ready", now),
                     ("today-sent", "sent", now - timedelta(hours=1)),
@@ -840,6 +912,115 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(full_task.context["confirmed_job_ids"], ["ready-job"])
         self.assertEqual(json.loads(response_body)["id"], "full-task")
 
+    def test_web_api_deliver_batch_continues_send_when_some_greetings_fail(self):
+        task = WorkbenchTask(id="deliver-partial", mode="full", label="运行全流程")
+        config = {
+            "_workbench_job_ids": ["job-1", "job-2"],
+            "_workbench_send_report": {
+                "requested_count": 1,
+                "sent_count": 1,
+                "failed_count": 0,
+                "deferred_count": 0,
+                "quota_deferred_count": 0,
+                "already_sent": 0,
+                "daily_limit": 0,
+                "remaining_quota": 0,
+            },
+        }
+        logs: list[str] = []
+        task.logs = logs
+
+        with (
+            patch("bosshunter.ai.greeter.generate_greetings", return_value=1) as generate,
+            patch("bosshunter.executor.sender.send_greetings", return_value=1) as send,
+        ):
+            server._execute_deliver_batch(task, config)
+
+        generate.assert_called_once()
+        send.assert_called_once()
+        self.assertTrue(any("未生成招呼语" in message and "手动填写" in message for message in logs))
+        self.assertTrue(any("继续进入发送流程" in message for message in logs))
+        self.assertEqual(task.metrics.get("send_success"), 1)
+
+    def test_web_api_manual_sent_records_external_send_without_using_boss_quota(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                external = _job("51job-manual")
+                external.update({"source_platform": "51job", "source_job_id": "51job-manual"})
+                insert_job(db, external)
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/jobs/manual-sent",
+                method="POST",
+                json_body={"job_ids": ["51job-manual"], "confirmed": True},
+            )
+            workbench_status, _, workbench_body = self._request("/api/workbench")
+            verify_db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                row = verify_db.execute(
+                    "SELECT status FROM jobs WHERE id = ?",
+                    ("51job-manual",),
+                ).fetchone()
+                history = verify_db.execute(
+                    "SELECT action FROM history WHERE job_id = ?",
+                    ("51job-manual",),
+                ).fetchall()
+            finally:
+                verify_db.close()
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(json.loads(body)["affected_count"], 1)
+        self.assertTrue(workbench_status.startswith("200"), workbench_body)
+        self.assertEqual(json.loads(workbench_body)["send_quota"]["sent"], 0)
+        self.assertEqual(row["status"], "sent")
+        self.assertEqual([item["action"] for item in history], ["manual_sent"])
+
+    def test_web_api_deliver_rejects_already_sent_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("already-sent"))
+                update_job_greeting(db, "already-sent", "已经发送过的招呼语")
+                update_job_status(db, "already-sent", "sent")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/workbench/deliver",
+                method="POST",
+                json_body={"job_ids": ["already-sent"]},
+            )
+
+        self.assertTrue(status.startswith("409"), body)
+        self.assertEqual(json.loads(body)["invalid_ids"], ["already-sent"])
+
+    def test_web_api_direct_send_requires_a_retryable_greeting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("error-without-greeting"))
+                update_job_status(db, "error-without-greeting", "error")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/workbench/deliver",
+                method="POST",
+                json_body={"job_ids": ["error-without-greeting"], "direct_send": True},
+            )
+
+        self.assertTrue(status.startswith("409"), body)
+        self.assertEqual(json.loads(body)["invalid_ids"], ["error-without-greeting"])
+
     def test_web_api_deliver_queues_confirmation_before_full_task_event_exists(self):
         full_task = WorkbenchTask(id="full-before-event", mode="full", label="运行全流程")
         runner = WorkbenchTaskRunner()
@@ -968,6 +1149,7 @@ class WebApiRouteTests(unittest.TestCase):
                 for job_id in ("already-scheduled", "new-ready"):
                     insert_job(db, _job(job_id))
                     update_job_status(db, job_id, "ready")
+                    update_job_greeting(db, job_id, f"{job_id} 的待发送招呼语")
             finally:
                 db.close()
             server.set_base_dir(base_dir)
@@ -1288,6 +1470,29 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertIn("招呼语发送结果：成功 1，失败 1，待下次发送 1（共 3）", task.logs)
         self.assertIn("1 个岗位发送失败已单独记录，继续后续流程", task.logs)
         self.assertIn("1 个岗位因今日发送额度未执行，已保留在“待发送招呼语”", task.logs)
+        self.assertEqual(task.stop_reason, "daily_limit")
+        self.assertEqual(task.metrics["send_success"], 1)
+        self.assertEqual(task.metrics["send_deferred"], 1)
+
+    def test_deliver_counts_preserved_greetings_as_ready(self):
+        task = WorkbenchTask(id="preserved-greeting", mode="deliver", label="投递")
+        config = {"_workbench_job_ids": ["job-a", "job-b", "job-c"]}
+
+        def fake_generate(greeting_config):
+            greeting_config["_workbench_greeting_report"] = {"skipped_existing": 1}
+            return 1
+
+        def fake_send(send_config, force=False):
+            send_config["_workbench_send_report"] = {"sent_count": 2}
+            return 2
+
+        with patch("bosshunter.ai.greeter.generate_greetings", side_effect=fake_generate), \
+             patch("bosshunter.executor.sender.send_greetings", side_effect=fake_send):
+            server._execute_deliver(task, config)
+
+        self.assertIn("招呼语准备完成：2/3（新生成 1）", task.logs)
+        self.assertTrue(any("1 个岗位未生成招呼语" in message for message in task.logs))
+        self.assertFalse(any("2 个岗位未生成招呼语" in message for message in task.logs))
 
     def test_deliver_still_stops_on_account_risk_signal(self):
         # Arrange
@@ -1745,6 +1950,111 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(history_actions[1]["action"], "replied")
         self.assertIn("已手动回复 HR", history_actions[1]["detail"])
 
+    def test_web_api_history_reply_confirmation_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("reply-once"))
+                add_history(db, "reply-once", "reply_pending", "AI建议回复")
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = 'reply_pending'",
+                    ("reply-once",),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            first_status, _, first_body = self._request(
+                f"/api/history/{history_id}/reply",
+                method="POST",
+                json_body={"message": "已手动回复 HR"},
+            )
+            second_status, _, second_body = self._request(
+                f"/api/history/{history_id}/reply",
+                method="POST",
+                json_body={"message": "已手动回复 HR"},
+            )
+
+            verify_db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                reply_count = verify_db.execute(
+                    "SELECT COUNT(*) FROM history WHERE job_id = ? AND action = 'replied'",
+                    ("reply-once",),
+                ).fetchone()[0]
+            finally:
+                verify_db.close()
+
+        self.assertTrue(first_status.startswith("200"), first_body)
+        self.assertTrue(second_status.startswith("200"), second_body)
+        self.assertTrue(json.loads(second_body)["already_resolved"])
+        self.assertEqual(reply_count, 1)
+
+    def test_web_api_history_dismiss_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("dismiss-once"))
+                add_history(db, "dismiss-once", "reply_pending", "AI建议回复")
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = 'reply_pending'",
+                    ("dismiss-once",),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            first_status, _, first_body = self._request(
+                f"/api/history/{history_id}/dismiss",
+                method="POST",
+                json_body={},
+            )
+            second_status, _, second_body = self._request(
+                f"/api/history/{history_id}/dismiss",
+                method="POST",
+                json_body={},
+            )
+
+            verify_db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                dismiss_count = verify_db.execute(
+                    "SELECT COUNT(*) FROM history WHERE job_id = ? AND action = 'reply_dismissed'",
+                    ("dismiss-once",),
+                ).fetchone()[0]
+            finally:
+                verify_db.close()
+
+        self.assertTrue(first_status.startswith("200"), first_body)
+        self.assertTrue(second_status.startswith("200"), second_body)
+        self.assertTrue(json.loads(second_body)["already_resolved"])
+        self.assertEqual(dismiss_count, 1)
+
+    def test_web_api_history_dismiss_rejects_stale_reply_round(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("dismiss-stale"))
+                add_history(db, "dismiss-stale", "reply_pending", "第一轮建议")
+                stale_history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = 'reply_pending'",
+                    ("dismiss-stale",),
+                ).fetchone()["id"]
+                add_history(db, "dismiss-stale", "reply_pending", "第二轮建议")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                f"/api/history/{stale_history_id}/dismiss",
+                method="POST",
+                json_body={},
+            )
+
+        self.assertTrue(status.startswith("409"), body)
+        self.assertIn("最新一轮", json.loads(body)["error"])
+
     def test_web_api_unresolved_count_includes_resume_failures_and_excludes_resolved_rows(self):
         # Arrange
         with tempfile.TemporaryDirectory() as tmp:
@@ -1780,10 +2090,12 @@ class WebApiRouteTests(unittest.TestCase):
             try:
                 insert_job(db, _job("resume-failed-open"))
                 insert_job(db, _job("resume-failed-resolved"))
+                insert_job(db, _job("reply-open"))
                 insert_job(db, _job("recent-job"))
                 add_history(db, "resume-failed-open", "resume_failed", "仍需处理")
                 add_history(db, "resume-failed-resolved", "resume_failed", "旧失败")
                 add_history(db, "resume-failed-resolved", "resume_sent", "后来已成功")
+                add_history(db, "reply-open", "reply_pending", "待确认回复")
                 add_history(db, "recent-job", "sent", "最近记录")
             finally:
                 db.close()
@@ -1797,7 +2109,11 @@ class WebApiRouteTests(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(
             {(item["job_id"], item["action"]) for item in payload},
-            {("recent-job", "sent"), ("resume-failed-open", "resume_failed")},
+            {
+                ("recent-job", "sent"),
+                ("reply-open", "reply_pending"),
+                ("resume-failed-open", "resume_failed"),
+            },
         )
 
     def test_web_api_history_exposes_structured_failure_reason_and_resolution_state(self):
@@ -1850,8 +2166,228 @@ class WebApiRouteTests(unittest.TestCase):
             "事实完整性校验失败：新增了 50%",
         )
         self.assertFalse(unresolved_item["resolved"])
+        self.assertEqual(unresolved_item["url"], "https://example.com/job")
+        self.assertEqual(unresolved_item["source_platform"], "boss")
         self.assertTrue(resolved_item["resolved"])
         self.assertEqual(resolved_item["resume_path"], "/tmp/generated.md")
+
+    def test_full_task_receives_global_boss_collection_options(self):
+        config = {
+            "search": {"keywords": ["旧关键词"], "cities": ["北京"]},
+            "profile": {"target_cities": ["北京"]},
+            "collection": {"default_order": ["boss"]},
+            "platforms": {
+                "boss": {"enabled": True, "search": {"keywords": ["全局关键词"], "cities": ["上海"], "max_pages": 2, "sort": "newest", "target_count": 4}},
+                "zhilian": {"enabled": False, "search": {}},
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
+            server, "_write_config"
+        ), patch.object(server.task_runner, "start", return_value={"id": "full-global-config"}) as start:
+            status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "full"})
+
+        self.assertTrue(status.startswith("200"), body)
+        task_config = start.call_args.args[1]
+        self.assertEqual(task_config["_collection_options"]["platforms"]["boss"]["keywords"], ["全局关键词"])
+        self.assertEqual(task_config["_collection_options"]["platforms"]["boss"]["cities"], ["上海"])
+        self.assertNotIn("target_count", task_config["_collection_options"]["platforms"]["boss"])
+        self.assertTrue(task_config["_collection_options"]["auto_score"])
+
+    def test_full_task_rejects_collection_only_platform_from_saved_config(self):
+        config = {
+            "search": {"keywords": ["人力"], "cities": ["深圳"]},
+            "profile": {"resume_path": "C:/resume.md"},
+            "ai": {"api_key": "test-key"},
+            "collection": {"default_order": ["boss", "zhilian"]},
+            "platforms": {
+                "boss": {"enabled": True, "search": {"keywords": ["人力"], "cities": ["深圳"]}},
+                "zhilian": {"enabled": True, "search": {"keywords": ["人力"], "cities": ["深圳"]}},
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
+            server.task_runner, "start", return_value={"id": "full-with-zhilian"}
+        ) as start:
+            status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "full"})
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertEqual(json.loads(body)["collection_only_platforms"], ["zhilian"])
+        start.assert_not_called()
+
+    def test_full_task_rejects_collection_only_platform_from_dialog(self):
+        config = {
+            "profile": {"resume_path": "C:/resume.md"},
+            "ai": {"api_key": "test-key"},
+            "collection": {"default_order": ["boss"]},
+            "platforms": {
+                "boss": {"enabled": True, "search": {}},
+                "zhilian": {"enabled": False, "search": {}},
+            },
+        }
+        options = {
+            "platform_order": ["zhilian"],
+            "auto_score": False,
+            "platforms": {
+                "zhilian": {
+                    "keywords": ["人力"],
+                    "cities": ["深圳"],
+                    "city_codes": {"深圳": "765"},
+                    "max_pages": 3,
+                    "sort": "default",
+                    "target_count": 3,
+                },
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
+            server, "_write_config"
+        ) as write_config, patch.object(server.task_runner, "start", return_value={"id": "full-dialog-options"}) as start:
+            status, _, body = self._request(
+                "/api/workbench/task",
+                method="POST",
+                json_body={"mode": "full", "options": options},
+            )
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertEqual(json.loads(body)["collection_only_platforms"], ["zhilian"])
+        start.assert_not_called()
+        write_config.assert_not_called()
+
+    def _seed_scoring_base(self, base_dir: Path):
+        (base_dir / "config.yaml").write_text(
+            yaml.dump({"ai": {"api_key": "test-api-key"}}, allow_unicode=True),
+            encoding="utf-8",
+        )
+        server.set_base_dir(base_dir)
+        db = get_db(server.DATA_DIR / "bosshunter.db")
+        try:
+            insert_job(db, _job("p1"))
+        finally:
+            db.close()
+
+    def _seed_run(self, run_id: str, status: str):
+        db_path = server.DATA_DIR / "bosshunter.db"
+        create_scoring_run(
+            db_path,
+            run_id=run_id,
+            options={"scope": "pending", "limit": None, "force_rescore": False},
+            job_ids=["p1"],
+        )
+        update_scoring_run(db_path, run_id, status=status, pause_reason="AI 服务请求失败" if status == "paused" else None)
+
+    def test_scoring_start_reports_paused_run_with_machine_readable_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_scoring_base(Path(tmp))
+            self._seed_run("run-paused", "paused")
+
+            with patch.object(server, "_preflight_messages", return_value=[]):
+                status, _, body = self._request(
+                    "/api/scoring/start",
+                    method="POST",
+                    json_body={"options": {"scope": "pending", "limit": None, "job_ids": [], "force_rescore": False}},
+                )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("409"), body)
+        self.assertEqual(payload.get("code"), "scoring_run_paused")
+        self.assertIn("强制开始新任务", payload["error"])
+
+    def test_scoring_start_ignores_non_boolean_force_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_scoring_base(Path(tmp))
+            self._seed_run("run-paused", "paused")
+            runner = MagicMock()
+
+            for bad_force in ("false", "true", 1):
+                with patch.object(server, "_preflight_messages", return_value=[]), patch.object(server, "task_runner", runner):
+                    status, _, body = self._request(
+                        "/api/scoring/start",
+                        method="POST",
+                        json_body={
+                            "force": bad_force,
+                            "options": {"scope": "pending", "limit": None, "job_ids": [], "force_rescore": False},
+                        },
+                    )
+
+                payload = json.loads(body)
+                self.assertTrue(status.startswith("409"), body)
+                self.assertEqual(payload.get("code"), "scoring_run_paused")
+
+            old_run = get_scoring_run(server.DATA_DIR / "bosshunter.db", "run-paused")
+            self.assertEqual(old_run["status"], "paused")
+            runner.start.assert_not_called()
+
+    def test_scoring_start_with_force_ends_paused_run_and_starts_new(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_scoring_base(Path(tmp))
+            self._seed_run("run-paused", "paused")
+            runner = MagicMock()
+            runner.start.return_value = {"id": "task-1", "status": "running"}
+
+            with patch.object(server, "_preflight_messages", return_value=[]), patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/scoring/start",
+                    method="POST",
+                    json_body={
+                        "force": True,
+                        "options": {"scope": "pending", "limit": None, "job_ids": [], "force_rescore": False},
+                    },
+                )
+
+            payload = json.loads(body)
+            old_run = get_scoring_run(server.DATA_DIR / "bosshunter.db", "run-paused")
+            self.assertTrue(status.startswith("200"), body)
+            self.assertEqual(old_run["status"], "stopped")
+            self.assertIn("强制结束", old_run["error"])
+            self.assertEqual(payload["run"]["status"], "running")
+            self.assertNotEqual(payload["run"]["id"], "run-paused")
+            runner.start.assert_called_once()
+
+    def test_scoring_start_with_force_still_rejects_active_running_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_scoring_base(Path(tmp))
+            self._seed_run("run-active", "running")
+            runner = MagicMock()
+
+            with patch.object(server, "_preflight_messages", return_value=[]), patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/scoring/start",
+                    method="POST",
+                    json_body={
+                        "force": True,
+                        "options": {"scope": "pending", "limit": None, "job_ids": [], "force_rescore": False},
+                    },
+                )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("409"), body)
+        self.assertIn("正在运行", payload["error"])
+        runner.start.assert_not_called()
+
+    def test_score_checkpoint_writes_error_for_ai_pause_but_not_user_pause(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_scoring_base(Path(tmp))
+            self._seed_run("run-checkpoint", "running")
+            task = WorkbenchTask(id="task-ckpt", mode="score", label="单独 AI 评分")
+            ai_pause = "AI 服务请求失败 (request_failed, status=404)"
+            states = [
+                {"remaining_job_ids": ["p1"], "status": "paused", "pause_reason": ai_pause, "error": ai_pause},
+                {"remaining_job_ids": ["p1"], "status": "paused", "pause_reason": "用户暂停或任务中断", "error": ""},
+            ]
+
+            def fake_score_jobs(config, *args, **kwargs):
+                callback = config.get("_workbench_score_checkpoint")
+                for state in states:
+                    callback(dict(state))
+
+            with patch("bosshunter.ai.scorer.score_jobs", side_effect=fake_score_jobs), patch.object(
+                server, "update_scoring_run", return_value=None
+            ) as update_run:
+                server._execute_score(task, {"_score_run_id": "run-checkpoint", "_score_options": {}})
+
+            paused_calls = [call for call in update_run.call_args_list if call.kwargs.get("status") == "paused"]
+            self.assertEqual(paused_calls[0].kwargs.get("error"), ai_pause)
+            self.assertEqual(paused_calls[1].kwargs.get("error"), None)
+            self.assertEqual(task.error, ai_pause)
+            self.assertTrue(task.stop_requested.is_set())
 
 
 if __name__ == "__main__":

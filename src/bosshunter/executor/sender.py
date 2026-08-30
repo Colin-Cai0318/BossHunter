@@ -16,9 +16,15 @@ from bosshunter.browser import (
     navigate,
     press_key,
     type_text,
+    wait_for_load,
 )
-from bosshunter.db import get_db, get_jobs_ready_to_send, update_job_status, add_history, add_risk_event
+from bosshunter.db import (
+    get_db, get_jobs_ready_to_send, update_job_status, add_history, add_risk_event,
+    set_platform_safety_lock,
+)
+from bosshunter.collection.capabilities import platform_supports
 from bosshunter.throttle import RequestThrottle, SendWindowChecker, ProgressiveBackoff, should_take_day_off
+from bosshunter.platform_safety import PlatformAccessGuard, PlatformSafetyStop
 
 console = Console()
 
@@ -518,39 +524,65 @@ def _message_delivery_state(target_id: str, greeting: str) -> str:
     return str(result.get("state") or "missing")
 
 
-def _submitted_message_looks_accepted(target_id: str, greeting: str) -> bool:
-    """Return true when Boss appears to have accepted a send despite missing echo."""
-    greeting_escaped = json.dumps(greeting, ensure_ascii=False)
-    result = _parse_js_result(evaluate(target_id, f"""
-    (() => {{
-        const normalize = (value) => String(value || '')
-            .replace(/[\\u200b-\\u200f\\ufeff]/g, '')
-            .replace(/\\s+/g, ' ')
-            .trim();
-        const expected = normalize({greeting_escaped});
-        const input = document.querySelector('#chat-input');
-        const inputText = normalize(input ? input.innerText || input.textContent || input.value : '');
-        const inputCleared = !!input && inputText.length === 0;
-        const ownMessages = Array.from(document.querySelectorAll(
-            '.chat-record .message-item.item-myself, .chat-record .item-myself, '
-            + '.chat-record .message-item.item-self, .chat-record [class*="item-my"]'
-        ));
-        const hasFailedOwnMessage = ownMessages.some((node) => {{
-            const statusNode = node.querySelector('.message-status');
-            const statusClass = statusNode ? String(statusNode.className || '') : '';
-            const text = normalize(node.innerText || node.textContent);
-            return statusClass.includes('status-error')
-                || (text.includes('发送失败') && (text.includes(expected) || expected.includes(text)));
-        }});
-        return JSON.stringify({{
-            success: true,
-            accepted: inputCleared && !hasFailedOwnMessage,
-            inputCleared,
-            hasFailedOwnMessage
-        }});
-    }})()
-    """))
-    return bool(result.get("success") and result.get("accepted"))
+def _verify_greeting_in_chat_list(
+    job: dict,
+    greeting: str,
+    stop_event,
+    attempts: int = 6,
+) -> bool:
+    """Confirm an ambiguous send from the matching BOSS chat-list row.
+
+    A cleared input only proves that the page handled the submit action. Require
+    the target company and complete greeting in the same row before recording a
+    success, so this fallback cannot cause an automatic duplicate or false sent
+    state.
+    """
+    company = " ".join(str(job.get("company") or "").split())
+    expected = " ".join(str(greeting or "").split())
+    if not company or not expected:
+        return False
+
+    target_id = new_tab("https://www.zhipin.com/web/geek/chat", background=True)
+    if not target_id:
+        return False
+
+    try:
+        wait_for_load(target_id, timeout=10)
+        company_json = json.dumps(company, ensure_ascii=False)
+        expected_json = json.dumps(expected, ensure_ascii=False)
+        expression = f"""
+        (() => {{
+			const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+            const expectedCompany = normalize({company_json});
+            const expectedGreeting = normalize({expected_json});
+            const rows = Array.from(document.querySelectorAll('li[role=listitem]'));
+            const matched = rows.some((row) => {{
+                const nameBox = row.querySelector('.name-box');
+                const spans = nameBox ? Array.from(nameBox.querySelectorAll('span')) : [];
+                const actualCompany = normalize(spans.length >= 2 ? spans[1].textContent : '');
+                const lastMessage = row.querySelector('.last-msg-text, .last-msg, .message-text');
+                const actualMessage = normalize(lastMessage ? lastMessage.textContent : row.innerText);
+                const companyMatches = actualCompany && (
+                    actualCompany === expectedCompany
+                    || actualCompany.includes(expectedCompany)
+                    || expectedCompany.includes(actualCompany)
+                );
+                return companyMatches && actualMessage.includes(expectedGreeting);
+            }});
+            return JSON.stringify({{success: true, matched}});
+        }})()
+        """
+        for attempt in range(max(1, attempts)):
+            if _stop_requested(stop_event):
+                return False
+            result = _parse_js_result(evaluate(target_id, expression, timeout=5))
+            if result.get("success") and result.get("matched"):
+                return True
+            if attempt + 1 < attempts and _sleep_or_stop(1, stop_event):
+                return False
+        return False
+    finally:
+        close_tab(target_id)
 
 
 def _submit_chat_message_background(target_id: str, greeting: str) -> dict:
@@ -684,6 +716,16 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
         for target in get_page_targets()
         if target.get("targetId")
     }
+    access_guard = throttle_config.get("_platform_access_guard")
+    if isinstance(access_guard, PlatformAccessGuard):
+        try:
+            access_guard.reserve("job_page")
+        except PlatformSafetyStop as exc:
+            return {
+                "success": False,
+                "error": exc.reason,
+                "history_detail": "为了账户安全，已达到平台页面访问上限或仍处于风险冷却",
+            }, None
     target_id = new_tab(job["url"], background=True)
     if not target_id:
         return {"success": False, "error": "open_page_failed", "history_detail": "无法打开页面", "skip_backoff": True}, None
@@ -779,6 +821,14 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
 
     if not chat_ready.get("success"):
         if contact_action == "first_contact_submitted":
+            if _verify_greeting_in_chat_list(job, greeting, stop_event):
+                close_tab(target_id)
+                return {
+                    "success": True,
+                    "verified": True,
+                    "first_contact": True,
+                    "verified_from_chat_list": True,
+                }, None
             return {
                 "success": False,
                 "error": "first_contact_navigation_unverified",
@@ -817,18 +867,27 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
                         "verified": True,
                         "first_contact": True,
                     }, None
+                if _verify_greeting_in_chat_list(job, greeting, stop_event):
+                    close_tab(target_id)
+                    return {
+                        "success": True,
+                        "verified": True,
+                        "first_contact": True,
+                        "verified_from_chat_list": True,
+                    }, None
                 return {
                     "success": False,
                     "error": "first_contact_send_not_stable",
                     "history_detail": "首次招呼语曾出现但未稳定保留在会话中",
                     "skip_backoff": True,
                 }, target_id
-        if _submitted_message_looks_accepted(target_id, greeting):
+        if _verify_greeting_in_chat_list(job, greeting, stop_event):
             close_tab(target_id)
             return {
                 "success": True,
-                "accepted_without_echo": True,
+                "verified": True,
                 "first_contact": True,
+                "verified_from_chat_list": True,
             }, None
         return {
             "success": False,
@@ -888,6 +947,13 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
             if _message_delivery_state(target_id, greeting) == "delivered":
                 close_tab(target_id)
                 return {"success": True, "verified": True}, None
+            if _verify_greeting_in_chat_list(job, greeting, stop_event):
+                close_tab(target_id)
+                return {
+                    "success": True,
+                    "verified": True,
+                    "verified_from_chat_list": True,
+                }, None
             return {
                 "success": False,
                 "error": "send_not_stable",
@@ -895,9 +961,13 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
                 "skip_backoff": True,
             }, target_id
 
-    if _submitted_message_looks_accepted(target_id, greeting):
+    if _verify_greeting_in_chat_list(job, greeting, stop_event):
         close_tab(target_id)
-        return {"success": True, "accepted_without_echo": True}, None
+        return {
+            "success": True,
+            "verified": True,
+            "verified_from_chat_list": True,
+        }, None
 
     return {
         "success": False,
@@ -910,7 +980,7 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
 def send_greetings(config: dict, force: bool = False) -> int:
     """Send generated greetings. Returns count of successfully sent."""
     db = get_db()
-    throttle_config = config.get("throttle", {})
+    throttle_config = dict(config.get("throttle", {}))
     stop_event = config.get("_workbench_stop_event")
     workbench_job_ids = {str(job_id) for job_id in config.get("_workbench_job_ids", [])}
     send_report = {
@@ -922,14 +992,25 @@ def send_greetings(config: dict, force: bool = False) -> int:
         "failed_count": 0,
         "deferred_count": len(workbench_job_ids),
         "quota_deferred_count": 0,
+        "already_sent": 0,
+        "daily_limit": 0,
+        "remaining_quota": 0,
         "stop_reason": None,
     }
     # Keep the integer return value for CLI/backward compatibility while giving
     # the web workflow enough detail to distinguish failures from quota deferrals.
     config["_workbench_send_report"] = send_report
     if isinstance(stop_event, Event):
-        throttle_config = dict(throttle_config)
         throttle_config["_workbench_stop_event"] = stop_event
+    access_guard = PlatformAccessGuard(db, config, "send")
+    throttle_config["_platform_access_guard"] = access_guard
+    try:
+        access_guard.ensure_unlocked()
+    except PlatformSafetyStop as exc:
+        send_report["stop_reason"] = exc.reason
+        console.print("[yellow]为了账户安全，平台风险冷却尚未结束，已停止投递[/yellow]")
+        db.close()
+        return 0
 
     # Anti-ban: random day off (可通过 --force 跳过)
     day_off_prob = throttle_config.get("day_off_probability", 0.05)
@@ -955,6 +1036,15 @@ def send_greetings(config: dict, force: bool = False) -> int:
     jobs = get_jobs_ready_to_send(db)
     if workbench_job_ids:
         jobs = [job for job in jobs if str(job["id"]) in workbench_job_ids]
+    unsupported_jobs = [
+        job for job in jobs
+        if not platform_supports(str(job.get("source_platform") or "boss"), "deliver")
+    ]
+    if unsupported_jobs:
+        send_report["unsupported_platform_ids"] = [str(job["id"]) for job in unsupported_jobs]
+        for job in unsupported_jobs:
+            console.print(f"[yellow]跳过岗位：{job.get('company', '')}｜{job.get('title', '')}（来源平台未提供发送适配器）[/yellow]")
+        jobs = [job for job in jobs if job not in unsupported_jobs]
     send_report["eligible_count"] = len(jobs)
     send_report["deferred_count"] = len(workbench_job_ids) if workbench_job_ids else len(jobs)
 
@@ -976,6 +1066,9 @@ def send_greetings(config: dict, force: bool = False) -> int:
     already_sent = today_sent["cnt"] if today_sent else 0
 
     remaining_quota = daily_limit - already_sent
+    send_report["already_sent"] = already_sent
+    send_report["daily_limit"] = daily_limit
+    send_report["remaining_quota"] = max(remaining_quota, 0)
     if remaining_quota <= 0:
         console.print(f"[yellow]今日已达发送上限 ({daily_limit})[/yellow]")
         send_report["quota_deferred_count"] = len(jobs)
@@ -991,6 +1084,7 @@ def send_greetings(config: dict, force: bool = False) -> int:
     throttle = RequestThrottle(delay_min=interval_min, delay_max=interval_max)
     backoff = ProgressiveBackoff()
     sent_count = 0
+    workbench_log = config.get("_workbench_log")
 
     console.print(f"[bold]准备发送 {len(jobs_to_send)} 条招呼语[/bold] (今日已发 {already_sent}/{daily_limit})")
 
@@ -1003,7 +1097,7 @@ def send_greetings(config: dict, force: bool = False) -> int:
     ) as progress:
         task = progress.add_task("发送中", total=len(jobs_to_send))
 
-        for job in jobs_to_send:
+        for index, job in enumerate(jobs_to_send):
             if _stop_requested(stop_event):
                 console.print("[yellow]已请求停止，结束发送[/yellow]")
                 send_report["stop_reason"] = "stopped"
@@ -1017,14 +1111,29 @@ def send_greetings(config: dict, force: bool = False) -> int:
                 progress.update(task, advance=1)
                 continue
 
+            current_job = f"{job.get('company') or '公司未知'}｜{job.get('title') or '职位未知'}"
+            next_job = jobs_to_send[index + 1] if index + 1 < len(jobs_to_send) else None
+            next_label = (
+                f"下一条：{next_job.get('company') or '公司未知'}｜{next_job.get('title') or '职位未知'}"
+                if next_job else "下一条：无"
+            )
+
             # Wait between sends (except first)
             if sent_count > 0:
+                if callable(workbench_log):
+                    workbench_log(
+                        f"招呼语进度 {index + 1}/{len(jobs_to_send)}\n等待发送：{current_job}\n{next_label}"
+                    )
                 progress.update(task, description="等待间隔...")
                 if throttle.wait(stop_event):
                     console.print("[yellow]已请求停止，结束发送[/yellow]")
                     send_report["stop_reason"] = "stopped"
                     break
 
+            if callable(workbench_log):
+                workbench_log(
+                    f"招呼语进度 {index + 1}/{len(jobs_to_send)}\n正在发送：{current_job}\n{next_label}"
+                )
             progress.update(task, description=f"发送: {job['company'][:10]} - {job['title'][:15]}")
 
             result_data, failed_target_id = _send_greeting_once(job, greeting, throttle_config)
@@ -1056,6 +1165,10 @@ def send_greetings(config: dict, force: bool = False) -> int:
                 backoff.record_success()
             else:
                 error = result_data.get("error", "unknown")
+                if error in {"daily_platform_page_limit", "persistent_risk_lock"}:
+                    send_report["stop_reason"] = error
+                    console.print("[yellow]为了账户安全，已达到平台页面访问上限或仍处于风险冷却，停止投递[/yellow]")
+                    break
                 send_report["failed_count"] += 1
                 update_job_status(db, job["id"], "error")
                 add_history(db, job["id"], "error", result_data.get("history_detail", f"发送失败: {error}"))
@@ -1073,6 +1186,12 @@ def send_greetings(config: dict, force: bool = False) -> int:
                 if error in ["captcha", "rate_limit", "blocked"]:
                     console.print(f"\n[red]⚠ 检测到风控信号: {error}，安全暂停[/red]")
                     add_risk_event(db, error, f"触发风控: {error}")
+                    lock_minutes = config.get("safety", {}).get("risk_lock_minutes", 10)
+                    try:
+                        lock_minutes = max(int(lock_minutes), 1)
+                    except (TypeError, ValueError):
+                        lock_minutes = 10
+                    set_platform_safety_lock(db, error, minutes=lock_minutes)
                     send_report["stop_reason"] = error
                     break
 
@@ -1080,6 +1199,12 @@ def send_greetings(config: dict, force: bool = False) -> int:
                 if backoff.should_pause_long:
                     console.print(f"\n[red]⚠ 连续错误过多，暂停 {int(pause_duration/60)} 分钟[/red]")
                     add_risk_event(db, "backoff_pause", f"暂停{int(pause_duration)}秒")
+                    lock_minutes = config.get("safety", {}).get("risk_lock_minutes", 10)
+                    try:
+                        lock_minutes = max(int(lock_minutes), 1)
+                    except (TypeError, ValueError):
+                        lock_minutes = 10
+                    set_platform_safety_lock(db, "consecutive_errors", minutes=lock_minutes)
                     send_report["stop_reason"] = "consecutive_errors"
                     break
                 elif pause_duration > 0:
