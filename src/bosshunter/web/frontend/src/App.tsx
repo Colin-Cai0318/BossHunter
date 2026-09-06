@@ -16,11 +16,11 @@ function MonitorPage() {
 export default function App() {
   return (
     <BrowserRouter>
-      <div className="flex h-screen overflow-hidden bg-background text-foreground">
+      <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground md:flex-row">
         <Sidebar />
         <div className="min-w-0 flex-1 flex flex-col overflow-hidden">
           <Header />
-          <main className="min-w-0 flex-1 overflow-y-auto p-6">
+          <main className="min-w-0 flex-1 overflow-y-auto p-3 sm:p-6">
             <Routes>
               <Route path="/" element={<DashboardPage />} />
               <Route path="/jobs" element={<JobsPage />} />

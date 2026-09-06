@@ -101,13 +101,20 @@ def replace_fact_candidates(
 ) -> list[dict[str, Any]]:
 	accepted_keys: set[tuple[str, str, str, str, str]] = set()
 	accepted_legacy_content: set[str] = set()
+	protected_ids: list[str] = []
 	for row in conn.execute(
 		"""
-		SELECT fact_type, entity_type, field_name, group_id, content, edited_content
-		FROM resume_facts WHERE source_id = ? AND status = 'accepted'
+		SELECT id, fact_type, entity_type, field_name, group_id, content, edited_content
+		FROM resume_facts f WHERE source_id = ? AND (
+			status != 'pending' OR edited_content IS NOT NULL
+			OR EXISTS (SELECT 1 FROM resume_version_facts WHERE fact_id = f.id)
+			OR EXISTS (SELECT 1 FROM resume_profile_facts WHERE fact_id = f.id)
+			OR EXISTS (SELECT 1 FROM resume_clarifications WHERE fact_id = f.id)
+		)
 		""",
 		(source_id,),
 	).fetchall():
+		protected_ids.append(row["id"])
 		fact_type = str(row["fact_type"] or "legacy")
 		if fact_type == "legacy":
 			accepted_legacy_content.add(str(row["content"]).strip().casefold())
@@ -123,16 +130,19 @@ def replace_fact_candidates(
 		accepted_keys.add((*base_key, str(row["content"]).strip().casefold()))
 		if row["edited_content"]:
 			accepted_keys.add((*base_key, str(row["edited_content"]).strip().casefold()))
+	protected_sql = ", ".join("?" for _ in protected_ids) or "NULL"
+	removable = f"source_id = ? AND id NOT IN ({protected_sql})" if protected_ids else "source_id = ?"
+	params = [source_id, *protected_ids]
 	conn.execute(
-		"""
+		f"""
 		DELETE FROM resume_fact_evidence
 		WHERE fact_id IN (
-			SELECT id FROM resume_facts WHERE source_id = ? AND status != 'accepted'
+			SELECT id FROM resume_facts WHERE {removable}
 		)
 		""",
-		(source_id,),
+		params,
 	)
-	conn.execute("DELETE FROM resume_facts WHERE source_id = ? AND status != 'accepted'", (source_id,))
+	conn.execute(f"DELETE FROM resume_facts WHERE {removable}", params)
 	for fact in facts:
 		content = str(fact["content"]).strip()
 		fact_type = str(fact.get("fact_type", "legacy"))
@@ -258,7 +268,7 @@ def update_fact(
 	row = conn.execute("SELECT * FROM resume_facts WHERE id = ?", (fact_id,)).fetchone()
 	if row is None:
 		return None
-	cleaned = edited_content.strip() if isinstance(edited_content, str) else None
+	cleaned = edited_content.strip() if isinstance(edited_content, str) else row["edited_content"]
 	if cleaned == "":
 		cleaned = None
 	if cleaned == row["content"]:
@@ -274,17 +284,7 @@ def update_fact(
 		(status, cleaned, fact_id),
 	)
 	conn.commit()
-	return _record(
-		conn.execute(
-			"""
-			SELECT f.*, s.filename AS source_filename,
-			       COALESCE(f.edited_content, f.content) AS effective_content
-			FROM resume_facts f JOIN resume_sources s ON s.id = f.source_id
-			WHERE f.id = ?
-			""",
-			(fact_id,),
-		).fetchone()
-	)
+	return next(fact for fact in list_facts(conn, source_id=row["source_id"]) if fact["id"] == fact_id)
 
 
 def source_version_references(conn: sqlite3.Connection, source_id: str) -> int:
@@ -536,7 +536,7 @@ def list_profile_versions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 	rows = conn.execute(
 		"""
 		SELECT p.id FROM resume_profile_versions p
-		ORDER BY p.created_at DESC, p.id DESC
+		ORDER BY p.created_at DESC, p.rowid DESC
 		"""
 	).fetchall()
 	return [

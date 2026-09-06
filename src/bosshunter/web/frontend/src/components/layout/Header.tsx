@@ -6,6 +6,7 @@ const pageTitles: Record<string, string> = {
   '/jobs': '岗位池',
   '/monitor': '监测执行',
   '/config': '配置',
+  '/resume-studio': '简历工作室',
 }
 
 export function Header() {
@@ -13,8 +14,8 @@ export function Header() {
   const title = pageTitles[location.pathname] || 'BossHunter'
 
   return (
-    <header className="h-16 border-b border-card-border bg-[#FFFCFA] flex items-center justify-between px-6">
-      <h1 className="text-lg font-black text-foreground">{title}</h1>
+    <header className="h-16 shrink-0 border-b border-card-border bg-[#FFFCFA] flex items-center justify-between gap-3 px-3 sm:px-6">
+      <p className="text-lg font-black text-foreground">{title}</p>
       <div className="flex items-center gap-2 text-xs text-muted">
         <Activity className="w-3 h-3 text-success" />
         <span>本地服务运行中</span>

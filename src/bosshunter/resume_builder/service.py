@@ -147,6 +147,7 @@ STAR_COMPONENTS = ("situation", "task", "action", "result")
 OWNERSHIP_LEVELS = {"unknown", "participated", "collaborated", "responsible", "led"}
 PROFILE_STRONG_VERBS = ("主导", "牵头", "负责", "推动", "独立完成", "独立设计", "独立开发")
 _TOKEN_PATTERNS = [
+	re.compile(r"(?<![A-Za-z0-9.])\d+(?:\.\d+)?(?![A-Za-z0-9.])"),
 	re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])"),
 	re.compile(r"https?://[^\s)>）】]+", re.IGNORECASE),
 	re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)"),
@@ -821,10 +822,14 @@ def extract_source_facts(
 
 
 def _resume_fact_value(fact: dict) -> str:
+	if fact.get("edited_content"):
+		value = _clean_whitespace(str(fact["edited_content"]))
+		label = RESUME_FIELD_LABELS.get(str(fact.get("field_name")), "")
+		return re.sub(r"^" + re.escape(label) + r"[：:]\s*", "", value) if label else value
 	data = fact.get("structured_data")
 	if isinstance(data, dict) and data.get("value"):
-		return _clean_whitespace(str(data["value"]))[:160]
-	return _clean_whitespace(str(fact.get("effective_content") or ""))[:160]
+		return _clean_whitespace(str(data["value"]))
+	return _clean_whitespace(str(fact.get("effective_content") or ""))
 
 
 def _clarification_experience_label(fact: dict, facts: list[dict], excluded_field: str) -> str:
@@ -881,6 +886,9 @@ def refresh_profile_clarifications(conn: sqlite3.Connection) -> list[dict]:
 		result = data.get("result") if isinstance(data.get("result"), dict) else {}
 		action_text = _clean_whitespace(str(action.get("text") or fact["effective_content"]))[:240]
 		result_text = _clean_whitespace(str(result.get("text") or ""))[:180]
+		if fact.get("edited_content"):
+			action_text = _clean_whitespace(str(fact["effective_content"]))[:240]
+			result_text = ""
 		context = action_text or _clean_whitespace(str(fact["effective_content"]))[:240]
 		missing = {str(value) for value in data.get("missing_fields", [])}
 		question_specs = {
@@ -994,6 +1002,7 @@ def refresh_profile_clarifications(conn: sqlite3.Connection) -> list[dict]:
 			conflict_options.append({
 				"label": f"选项 {index}",
 				"value": entry["value"],
+				"fact_ids": [option_fact["id"] for option_fact in entry["facts"]],
 				"sources": sources,
 				"details": details,
 			})
@@ -1104,9 +1113,11 @@ def _profile_prompt(
 		if not isinstance(data, dict):
 			return None
 		if fact.get("fact_type") == "resume_field":
-			return {"value": data.get("value")}
+			return {"value": _resume_fact_value(fact)}
 		if fact.get("fact_type") != "star_story":
 			return None
+		if fact.get("edited_content"):
+			return {"title": data.get("title")}
 		result: dict = {
 			"title": data.get("title"),
 			"technologies": [
@@ -1131,6 +1142,8 @@ def _profile_prompt(
 				"id": fact["id"],
 				"group_id": fact.get("group_id"),
 				"source_filename": fact.get("source_filename"),
+				"content": fact.get("effective_content") or fact.get("content"),
+				"user_edited": bool(fact.get("edited_content")),
 				"structured_data": compact_structure(fact),
 			})
 			continue
@@ -1166,7 +1179,8 @@ def _profile_prompt(
 		answer = _clean_whitespace(str(item["answer"]))
 		if item.get("kind") == "derived_skill":
 			answer = re.split(r"[，；]", answer, maxsplit=1)[0]
-		key = (str(item.get("kind") or "confirmation"), answer.casefold())
+		kind = str(item.get("kind") or "confirmation")
+		key = (kind, str(item["id"]) if kind == "conflict" else answer.casefold())
 		grouped = grouped_answers.setdefault(key, {
 			"ids": [],
 			"fact_ids": [],
@@ -1175,6 +1189,9 @@ def _profile_prompt(
 		})
 		grouped["ids"].append(item["id"])
 		grouped["fact_ids"].extend(linked_fact_ids)
+		if kind == "conflict":
+			grouped["question"] = item.get("question")
+			grouped["conflict_options"] = metadata.get("conflict_options", [])
 	public_answers = []
 	for item in grouped_answers.values():
 		item["ids"] = list(dict.fromkeys(item["ids"]))
@@ -1203,7 +1220,7 @@ def _profile_prompt(
 生成阶段：{focus_instruction}
 
 规则：
-1. 只能使用输入中的信息，不得新增或推测数字、日期、技术、公司、职责和成果。
+1. 只能使用输入中的信息，不得新增或推测数字、日期、技术、公司、职责和成果。content 是用户审核后的正文；user_edited 为 true 时必须以该正文为准，不能恢复已删除的动作或结果。
 2. 每个输出条目必须引用有效 fact_ids 或 clarification_ids；简历实体 fields 每行依次为 [fact_id, field_name, value]，确认回答 ids 中的值是 clarification_id。
 3. 项目、竞赛或作品必须按 group_id、标题和来源文件归并；一个 project 下可以且应当包含多个 stars，每个 star 表达一个较小的技术贡献。
 4. 每个 star 的 bullet 应优先写成“使用/基于什么工具、技术、方法、流程或专业能力，解决/完成什么问题或任务；产生什么已证实结果”。没有结果证据时省略结果，不得编造，并把缺口放入 known_gaps。
@@ -1267,6 +1284,12 @@ def _validated_profile_item(
 	evidence_parts = []
 	for fact_id in fact_ids:
 		fact = fact_map[fact_id]
+		if fact.get("edited_content"):
+			data = fact.get("structured_data") or {}
+			evidence_parts.append(str(fact["effective_content"]))
+			if fact.get("fact_type") == "star_story" and isinstance(data, dict):
+				evidence_parts.append(str(data.get("title") or ""))
+			continue
 		evidence_parts.extend([
 			str(fact.get("effective_content", "")),
 			str(fact.get("evidence", "")),
@@ -1447,6 +1470,8 @@ def _validated_profile_payload(
 					_clean_whitespace(str(item.get("name", "")))
 					for item in data.get("technologies", []) if isinstance(item, dict) and item.get("name")
 				]
+				if fact.get("edited_content"):
+					action, result, technologies = {}, {}, []
 				fact_id = str(fact["id"])
 				stars.append({
 					"heading": "、".join(technologies[:3]) or "技术实现",
@@ -1699,7 +1724,7 @@ def compose_career_profile(
 	finally:
 		json_temporary.unlink(missing_ok=True)
 		markdown_temporary.unlink(missing_ok=True)
-	name = f"Career Profile {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M')}"
+	name = f"主简历 {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S')} · {profile_id[:6]}"
 	return create_profile_version(
 		conn,
 		name=name,
