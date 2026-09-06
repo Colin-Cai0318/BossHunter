@@ -164,7 +164,9 @@ const emptyWorkspace: Workspace = {
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init)
-  const data = await response.json()
+  const data = await response.json().catch(() => {
+    throw new Error(`服务返回异常（HTTP ${response.status}），请稍后重试`)
+  })
   if (!response.ok) throw new Error(data.error || '操作失败')
   return data as T
 }
@@ -179,11 +181,15 @@ export default function ResumeStudioPage() {
   const [factFilter, setFactFilter] = useState<FactStatus>('pending')
   const [clarificationDrafts, setClarificationDrafts] = useState<Record<string, string>>({})
   const [targetRole, setTargetRole] = useState('')
+  const [selectedProfileId, setSelectedProfileId] = useState('')
+  const [loadFailed, setLoadFailed] = useState(false)
 
   const loadWorkspace = useCallback(async () => {
     try {
       setWorkspace(await api<Workspace>('/api/resume-studio'))
+      setLoadFailed(false)
     } catch (error) {
+      setLoadFailed(true)
       setMessage({ ok: false, text: error instanceof Error ? error.message : '简历工作室加载失败' })
     } finally {
       setLoading(false)
@@ -199,7 +205,8 @@ export default function ResumeStudioPage() {
     () => workspace.facts.filter(fact => fact.status === factFilter),
     [factFilter, workspace.facts],
   )
-  const latestProfile = workspace.profile_versions[0]
+  const latestProfile = workspace.profile_versions.find(profile => profile.id === selectedProfileId)
+    ?? workspace.profile_versions[0]
   const openClarifications = workspace.clarifications.filter(item => item.status === 'open')
   const answeredClarifications = workspace.clarifications.filter(item => item.status === 'answered')
 
@@ -209,6 +216,7 @@ export default function ResumeStudioPage() {
     options: { refresh?: boolean } = {},
   ) => {
     setBusy(key)
+    setMessage(null)
     try {
       setMessage({ ok: true, text: await action() })
       if (options.refresh !== false) await loadWorkspace()
@@ -238,21 +246,32 @@ export default function ResumeStudioPage() {
 
   const uploadSources = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || [])
+    event.target.value = ''
     if (!files.length) return
     await run('upload', async () => {
       let duplicates = 0
+      let completed = 0
+      const failures: string[] = []
       for (const file of files) {
         const form = new FormData()
         form.append('file', file)
-        const result = await api<{ duplicate: boolean }>('/api/resume-studio/sources', {
-          method: 'POST',
-          body: form,
-        })
-        if (result.duplicate) duplicates += 1
+        try {
+          const result = await api<{ duplicate: boolean }>('/api/resume-studio/sources', {
+            method: 'POST',
+            body: form,
+          })
+          completed += 1
+          if (result.duplicate) duplicates += 1
+        } catch (error) {
+          failures.push(`${file.name}：${error instanceof Error ? error.message : '上传失败'}`)
+        }
+      }
+      if (failures.length) {
+        await loadWorkspace()
+        throw new Error(`已处理 ${completed}/${files.length} 份材料；失败 ${failures.length} 份。${failures.join('；')}`)
       }
       return `已处理 ${files.length} 份材料${duplicates ? `，其中 ${duplicates} 份为重复材料` : ''}`
     })
-    event.target.value = ''
   }
 
   const confirmExternalAI = (detail: string) => window.confirm(
@@ -271,7 +290,7 @@ export default function ResumeStudioPage() {
       body: JSON.stringify({ source_kind: sourceKind, external_ai_consent: true }),
     })
     setFactFilter('pending')
-    return `已从「${source.filename}」提取 ${result.facts.length} 条待审核事实`
+    return `「${source.filename}」现有 ${result.facts.filter(fact => fact.status === 'pending').length} 条待审核事实，已保留审核记录`
     })
   }
 
@@ -289,16 +308,17 @@ export default function ResumeStudioPage() {
         facts: current.facts.filter(fact => fact.source_id !== source.id),
       }))
       return `已删除材料「${source.filename}」`
-    }, { refresh: false })
+    })
   }
 
   const reviewFact = (fact: ResumeFact, status: FactStatus) => run(`fact:${fact.id}`, async () => {
-    const result = await api<{ fact: ResumeFact }>(`/api/resume-studio/facts/${fact.id}`, {
+    const result = await api<{ fact: ResumeFact; clarifications: Clarification[] }>(`/api/resume-studio/facts/${fact.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status, content: drafts[fact.id] ?? fact.effective_content }),
     })
     replaceWorkspaceFact(result.fact)
+    setWorkspace(current => ({ ...current, clarifications: result.clarifications }))
     setDrafts(current => {
       const next = { ...current }
       delete next[fact.id]
@@ -316,7 +336,7 @@ export default function ResumeStudioPage() {
     return '已整理 ' + result.clarifications.filter(item => item.status === 'open').length + ' 个待确认问题'
   }, { refresh: false })
 
-  const updateClarification = (item: Clarification, status: 'answered' | 'dismissed') =>
+  const updateClarification = (item: Clarification, status: 'answered' | 'dismissed' | 'open') =>
     run('clarification:' + item.id, async () => {
       const result = await api<{ clarification: Clarification }>('/api/resume-studio/profile/clarifications/' + item.id, {
         method: 'PATCH',
@@ -334,7 +354,10 @@ export default function ResumeStudioPage() {
         delete next[item.id]
         return next
       })
-      return status === 'answered' ? '补充信息已确认' : '该问题已忽略'
+      if (status === 'open') {
+        setClarificationDrafts(current => ({ ...current, [item.id]: item.answer || '' }))
+      }
+      return status === 'answered' ? '补充信息已确认' : status === 'open' ? '可以重新编辑回答' : '该问题已忽略，可在处理记录中恢复'
     }, { refresh: false })
 
   const composeProfile = () => {
@@ -345,6 +368,7 @@ export default function ResumeStudioPage() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ external_ai_consent: true, target_role: targetRole.trim() }),
     })
+    setSelectedProfileId(result.profile.id)
     setWorkspace(current => ({
       ...current,
       profile_versions: [
@@ -353,7 +377,7 @@ export default function ResumeStudioPage() {
       ],
     }))
     return '已生成「' + result.profile.name + '」，请检查事实覆盖率和正文'
-    }, { refresh: false })
+    })
   }
 
   const activateProfile = (profile: ProfileVersion) => run('activate-profile:' + profile.id, async () => {
@@ -385,6 +409,7 @@ export default function ResumeStudioPage() {
       setDrafts({})
       setClarificationDrafts({})
       setSourceKinds({})
+      setSelectedProfileId('')
       setWorkspace(emptyWorkspace)
       return '已清空简历工作室，并删除 ' + result.deleted_files + ' 个受管文件'
     }, { refresh: false })
@@ -410,10 +435,12 @@ export default function ResumeStudioPage() {
       </div>
 
       {message && (
-        <div className={`fixed right-6 top-6 z-50 max-w-md rounded-xl px-4 py-3 text-sm shadow-lg ${message.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-600'}`}>
+        <div role={message.ok ? 'status' : 'alert'} className={`fixed bottom-4 right-4 z-50 flex max-h-60 max-w-[calc(100vw-2rem)] items-start gap-3 overflow-y-auto rounded-xl px-4 py-3 text-sm shadow-lg sm:max-w-md ${message.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-600'}`}>
           {message.text}
+          <button aria-label="关闭提示" className="ml-auto shrink-0" onClick={() => setMessage(null)}><X className="h-4 w-4" /></button>
         </div>
       )}
+      {loadFailed && <Button variant="secondary" disabled={Boolean(busy)} onClick={() => { setMessage(null); void loadWorkspace() }}>重新加载工作室</Button>}
 
       <div className="grid gap-5 xl:grid-cols-[minmax(320px,0.8fr)_minmax(520px,1.2fr)]">
         <div className="space-y-5">
@@ -504,7 +531,7 @@ export default function ResumeStudioPage() {
             <CardHeader>
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <CardTitle>2. 审核材料事实</CardTitle>
-                <div className="flex gap-1">
+                <div className="flex flex-wrap gap-1">
                   {(['pending', 'accepted', 'rejected'] as FactStatus[]).map(status => (
                     <Button
                       key={status}
@@ -529,6 +556,7 @@ export default function ResumeStudioPage() {
                     <span className="truncate text-xs text-muted">来源：{fact.source_filename}</span>
                   </div>
                   <textarea
+                    aria-label={`审核事实：${fact.category}`}
                     className="min-h-20 w-full rounded-lg border border-card-border bg-white p-3 text-sm outline-none focus:border-primary"
                     value={drafts[fact.id] ?? fact.effective_content}
                     onChange={event => setDrafts(current => ({ ...current, [fact.id]: event.target.value }))}
@@ -540,10 +568,11 @@ export default function ResumeStudioPage() {
                   </div>
                   {fact.fact_type === 'star_story' && fact.structured_data && (
                     <div className="mt-2 space-y-2 rounded-lg border border-card-border p-3">
+                      <p className="text-xs text-muted">原始提取结构；修改后以审核正文为准。</p>
                       <div className="flex flex-wrap items-center gap-2 text-xs">
                         <span className="font-bold">{fact.structured_data.title || '未命名项目'}</span>
                         <span className="text-muted">STAR 完整度 {Math.round((fact.completeness || 0) * 100)}%</span>
-                        <span className="text-muted">贡献边界：{fact.structured_data.ownership_level || 'unknown'}</span>
+                        <span className="text-muted">贡献边界：{{ unknown: '待确认', participated: '参与', collaborated: '协作', responsible: '负责', led: '主导' }[fact.structured_data.ownership_level || 'unknown'] || '待确认'}</span>
                       </div>
                       {(['situation', 'task', 'action', 'result'] as const).map(component => {
                         const value = fact.structured_data?.[component]
@@ -582,7 +611,7 @@ export default function ResumeStudioPage() {
                         退回待审核
                       </Button>
                     )}
-                    <Button size="sm" disabled={Boolean(busy)} onClick={() => reviewFact(fact, 'accepted')}>
+                    <Button size="sm" disabled={Boolean(busy) || !(drafts[fact.id] ?? fact.effective_content).trim()} onClick={() => reviewFact(fact, 'accepted')}>
                       <Check className="mr-1 h-3 w-3" />{fact.status === 'accepted' ? '保存修改' : '接受'}
                     </Button>
                   </div>
@@ -669,6 +698,7 @@ export default function ResumeStudioPage() {
                   </p>
                 )}
                 <textarea
+                  aria-label="补充确认回答"
                   className="mt-3 min-h-20 w-full rounded-lg border border-card-border bg-white p-3 text-sm outline-none focus:border-primary"
                   placeholder={item.kind === 'conflict' ? '例如：保留选项 1；或说明选项 1、2 分别属于哪段经历' : '填写可在面试中解释、可追溯的真实信息'}
                   value={clarificationDrafts[item.id] || ''}
@@ -697,6 +727,20 @@ export default function ResumeStudioPage() {
                 </div>
               </div>
             ))}
+            {workspace.clarifications.some(item => item.status !== 'open') && (
+              <details className="rounded-xl border border-card-border p-4">
+                <summary className="cursor-pointer text-sm font-bold">已回答和已忽略的问题</summary>
+                {workspace.clarifications.filter(item => item.status !== 'open').map(item => (
+                  <div key={item.id} className="mt-3 border-t border-card-border pt-3 text-sm">
+                    <p>{item.question}</p>
+                    <p className="mt-2 whitespace-pre-wrap text-muted">{item.status === 'dismissed' ? '已忽略' : item.answer}</p>
+                    <Button className="mt-2" variant="secondary" size="sm" disabled={Boolean(busy)} onClick={() => updateClarification(item, 'open')}>
+                      {item.status === 'dismissed' ? '恢复问题' : '修改回答'}
+                    </Button>
+                  </div>
+                ))}
+              </details>
+            )}
           </div>
 
           <div className="space-y-3">
@@ -738,7 +782,7 @@ export default function ResumeStudioPage() {
                         )}
                       </p>
                     </div>
-                    <div className="flex gap-2">
+                    <div className="flex flex-wrap gap-2">
                       <a href={'/api/resume-studio/profile/versions/' + latestProfile.id + '/download'}>
                         <Button variant="secondary" size="sm"><Download className="mr-1 h-3 w-3" />Markdown</Button>
                       </a>
@@ -791,9 +835,9 @@ export default function ResumeStudioPage() {
                 {workspace.profile_versions.length > 1 && (
                   <div className="border-t border-card-border pt-3">
                     <p className="mb-2 text-xs font-bold text-muted">历史版本</p>
-                    {workspace.profile_versions.slice(1).map(profile => (
+                    {workspace.profile_versions.filter(profile => profile.id !== latestProfile.id).map(profile => (
                       <div key={profile.id} className="flex items-center justify-between py-1 text-xs text-muted">
-                        <span>{profile.name}{profile.status === 'active' ? ' · 已启用' : ''}</span>
+                        <button className="text-left text-primary hover:underline" onClick={() => setSelectedProfileId(profile.id)}>{profile.name}{profile.status === 'active' ? ' · 已启用' : ''} · 查看与启用</button>
                         <a className="text-primary hover:underline" href={'/api/resume-studio/profile/versions/' + profile.id + '/download'}>下载</a>
                       </div>
                     ))}

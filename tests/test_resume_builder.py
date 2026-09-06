@@ -715,6 +715,88 @@ class ResumeBuilderTests(unittest.TestCase):
 
 		self.assertEqual(updated["effective_content"], fact["content"])
 
+	def test_review_returns_same_typed_fact_as_reload_and_preserves_edit_on_status_change(self):
+		fact = self._extract(self._source()["id"])[0]
+		edited = "使用 Python 开发虚构演示工具，服务 12 名测试用户。"
+		updated = update_fact(self.connection, fact["id"], status="accepted", edited_content=edited)
+		self.assertEqual(updated, list_facts(self.connection)[0])
+		self.assertIsInstance(updated["structured_data"], dict)
+		self.assertTrue(updated["evidence_items"])
+		updated = update_fact(self.connection, fact["id"], status="pending")
+		self.assertEqual(updated["effective_content"], edited)
+
+	def test_profile_prompt_uses_reviewed_star_and_rejects_removed_metric(self):
+		from bosshunter.resume_builder.service import _validated_profile_item
+		fact = self._extract(self._source()["id"])[0]
+		edited = "使用 Python 开发虚构演示工具，服务 12 名测试用户。"
+		fact = update_fact(self.connection, fact["id"], status="accepted", edited_content=edited)
+		prompt = _profile_prompt([fact], [])
+		self.assertIn(edited, prompt)
+		self.assertNotIn("20 名用户", prompt)
+		with self.assertRaisesRegex(ResumeBuilderError, "无来源事实"):
+			_validated_profile_item({"text": "服务 20 名用户", "fact_ids": [fact["id"]]}, {fact["id"]: fact}, {})
+
+	def test_profile_prompt_uses_corrected_resume_field(self):
+		from bosshunter.resume_builder.service import _resume_fact_value
+		fact = {
+			"id": "fictional-name", "fact_type": "resume_field", "entity_type": "identity",
+			"field_name": "name", "structured_data": {"value": "虚构旧姓名"},
+			"edited_content": "姓名：林知遥（虚构）", "effective_content": "姓名：林知遥（虚构）",
+		}
+		self.assertEqual(_resume_fact_value(fact), "林知遥（虚构）")
+		prompt = _profile_prompt([fact], [])
+		self.assertIn("林知遥（虚构）", prompt)
+		self.assertNotIn("虚构旧姓名", prompt)
+
+	def test_conflict_choice_keeps_option_mapping_and_question_identity(self):
+		fact = self._extract(self._source()["id"])[0]
+		items = [{
+			"id": f"conflict-{index}", "fact_id": fact["id"], "kind": "conflict", "status": "answered",
+			"question": f"虚构冲突 {index}", "answer": "保留选项 1",
+			"metadata": {"conflict_options": [{"label": "选项 1", "value": f"虚构值 {index}", "fact_ids": [fact["id"]]}]},
+		} for index in (1, 2)]
+		prompt = _profile_prompt([fact], items)
+		answers = json.loads(prompt.split("已确认回答：\n", 1)[1])
+		self.assertEqual(len(answers), 2)
+		self.assertEqual(answers[0]["conflict_options"][0]["value"], "虚构值 1")
+		self.assertEqual(answers[1]["question"], "虚构冲突 2")
+
+	def test_profile_version_order_uses_creation_order_when_timestamps_tie(self):
+		from bosshunter.resume_builder.store import create_profile_version
+		for profile_id in ("z-first", "a-second"):
+			create_profile_version(
+				self.connection, name="虚构版本", profile={}, markdown="虚构", quality_report={},
+				json_path="unused.json", markdown_path="unused.md", fact_ids=[], clarification_ids=[], profile_id=profile_id,
+			)
+		self.connection.execute("UPDATE resume_profile_versions SET created_at = '2026-09-06 00:00:00'")
+		self.connection.commit()
+		self.assertEqual([p["id"] for p in list_profile_versions(self.connection)], ["a-second", "z-first"])
+
+	def test_profile_fallback_does_not_restore_removed_star_structure(self):
+		from bosshunter.resume_builder.service import _validated_profile_payload
+		fact = self._extract(self._source()["id"])[0]
+		fact = update_fact(self.connection, fact["id"], status="accepted", edited_content="参与虚构工具演示")
+		profile, *_ = _validated_profile_payload({}, [fact], [], allow_partial=True)
+		star = profile["projects"][0]["stars"][0]
+		self.assertEqual(star["action"], "参与虚构工具演示")
+		self.assertEqual(star["technologies"], [])
+		self.assertNotIn("20", " ".join(star[key] for key in ("action", "result", "bullet", "heading")))
+
+	def test_reextract_preserves_rejected_fact_and_referenced_pending_fact(self):
+		source = self._source()
+		fact = self._extract(source["id"])[0]
+		update_fact(self.connection, fact["id"], status="rejected")
+		self._extract(source["id"])
+		self.assertEqual([(f["id"], f["status"]) for f in list_facts(self.connection)], [(fact["id"], "rejected")])
+		update_fact(self.connection, fact["id"], status="accepted")
+		question = refresh_profile_clarifications(self.connection)[0]
+		update_clarification(self.connection, question["id"], status="answered", answer="未统计")
+		update_fact(self.connection, fact["id"], status="pending")
+		self._extract(source["id"])
+		self.assertEqual(list_facts(self.connection)[0]["id"], fact["id"])
+		self.assertEqual(list_clarifications(self.connection)[0]["fact_id"], fact["id"])
+		self.assertEqual(self.connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+
 	def test_compose_uses_only_accepted_fact_ids_and_writes_version(self):
 		source = self._source()
 		fact = self._extract(source["id"])[0]

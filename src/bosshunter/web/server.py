@@ -2333,7 +2333,7 @@ def api_resume_studio_fact_update(fact_id):
 		)
 		if not fact:
 			return _json_response({"error": "事实不存在"}, 404)
-		return _json_response({"success": True, "fact": fact})
+		return _json_response({"success": True, "fact": fact, "clarifications": refresh_profile_clarifications(db)})
 	except ValueError as exc:
 		return _json_response({"error": str(exc)}, 400)
 	except Exception as exc:
